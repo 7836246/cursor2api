@@ -16,6 +16,6 @@ browser:
   # 也可通过环境变量 BROWSER_PATH 设置
   path: ""
   # 自动执行模式：当 AI 拒绝执行时，自动提取并执行命令
-  # true = 开启（默认），false = 关闭
+  # true = 开启，false = 关闭（默认）
   # 也可通过环境变量 AUTO_EXECUTE=true/false 设置
-  auto_execute: true
+  auto_execute: false
