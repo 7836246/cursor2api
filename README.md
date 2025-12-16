@@ -18,6 +18,8 @@
 - ❌ 不支持 Anthropic 原生的 `tool_use` 协议
 - ✅ 本项目通过**自动执行模式**解决此限制（见下方说明）
 
+> 💡 **建议开启自动执行模式** (`auto_execute: true`)，可以实现类似工具调用的效果。当 AI 输出命令建议时，系统会自动提取并执行。
+
 ## 功能特性
 
 - **Anthropic Messages API** - 完整支持 `/v1/messages` 接口

@@ -379,42 +379,39 @@ func handleStream(c *gin.Context, cursorReq browser.CursorChatRequest, model str
 				isError = true
 			}
 
-			// 发送工具调用块
-			toolID := "toolu_" + generateID()
-			stopReason = "tool_use"
+			// 清除之前发送的 AI 拒绝文本，发送一个新的干净的文本块
+			// 注意：SSE 流已经发送了拒绝文本，我们只能追加结果
+			// 发送执行结果作为新的文本块（替代之前的拒绝内容）
+			statusEmoji := "✅"
+			statusText := "执行成功"
+			if isError {
+				statusEmoji = "❌"
+				statusText = "执行失败"
+			}
+
+			// 简洁的结果输出，不显示 AI 的废话
+			var resultMsg string
+			if resultText == "" {
+				resultMsg = fmt.Sprintf("\n\n---\n%s **%s**\n```bash\n%s\n```", statusEmoji, statusText, cmd)
+			} else {
+				resultMsg = fmt.Sprintf("\n\n---\n%s **%s**\n```bash\n%s\n```\n输出:\n```\n%s\n```", statusEmoji, statusText, cmd, resultText)
+			}
+			resultJSON, _ := json.Marshal(resultMsg)
 
 			c.Writer.WriteString("event: content_block_start\n")
-			c.Writer.WriteString(fmt.Sprintf(`data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"%s","name":"bash","input":{}}}`+"\n\n", toolID))
+			c.Writer.WriteString(`data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}` + "\n\n")
 			flusher.Flush()
 
-			inputJSON, _ := json.Marshal(map[string]string{"command": cmd})
 			c.Writer.WriteString("event: content_block_delta\n")
-			c.Writer.WriteString(fmt.Sprintf(`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"%s"}}`+"\n\n", escapeJSON(string(inputJSON))))
+			c.Writer.WriteString(`data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":` + string(resultJSON) + `}}` + "\n\n")
 			flusher.Flush()
 
 			c.Writer.WriteString("event: content_block_stop\n")
 			c.Writer.WriteString(`data: {"type":"content_block_stop","index":1}` + "\n\n")
 			flusher.Flush()
 
-			// 发送执行结果作为新的文本块
-			statusEmoji := "✅"
-			if isError {
-				statusEmoji = "❌"
-			}
-			resultMsg := fmt.Sprintf("\n\n%s 已自动执行:\n```\n%s\n```\n结果:\n```\n%s\n```", statusEmoji, cmd, resultText)
-			resultJSON, _ := json.Marshal(resultMsg)
-
-			c.Writer.WriteString("event: content_block_start\n")
-			c.Writer.WriteString(`data: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}` + "\n\n")
-			flusher.Flush()
-
-			c.Writer.WriteString("event: content_block_delta\n")
-			c.Writer.WriteString(`data: {"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":` + string(resultJSON) + `}}` + "\n\n")
-			flusher.Flush()
-
-			c.Writer.WriteString("event: content_block_stop\n")
-			c.Writer.WriteString(`data: {"type":"content_block_stop","index":2}` + "\n\n")
-			flusher.Flush()
+			// 设置 stop_reason 为 end_turn 而不是 tool_use
+			stopReason = "end_turn"
 		}
 	} else if len(toolCalls) > 0 {
 		stopReason = "tool_use"

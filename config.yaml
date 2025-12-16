@@ -7,6 +7,8 @@ port: 3010
 # 浏览器设置
 browser:
   # 是否使用无头模式
+
+
   headless: true
   # Chromium 可执行文件路径
   # 留空则自动检测系统浏览器，如果都没有则自动下载 Chromium
@@ -18,4 +20,4 @@ browser:
   # 自动执行模式：当 AI 拒绝执行时，自动提取并执行命令
   # true = 开启，false = 关闭（默认）
   # 也可通过环境变量 AUTO_EXECUTE=true/false 设置
-  auto_execute: false
+  auto_execute: true
