@@ -94,6 +94,13 @@
             </set>
           </value>
         </entry>
+        <entry key="Function">
+          <value>
+            <set>
+              <option value="file://$PROJECT_DIR$/internal/toolify/toolify.go" />
+            </set>
+          </value>
+        </entry>
         <entry key="Message">
           <value>
             <set>
@@ -147,6 +154,27 @@
           <value>
             <set>
               <option value="file://$PROJECT_DIR$/internal/browser/browser.go" />
+            </set>
+          </value>
+        </entry>
+        <entry key="ToolCall">
+          <value>
+            <set>
+              <option value="file://$PROJECT_DIR$/internal/toolify/toolify.go" />
+            </set>
+          </value>
+        </entry>
+        <entry key="ToolCallFunction">
+          <value>
+            <set>
+              <option value="file://$PROJECT_DIR$/internal/toolify/toolify.go" />
+            </set>
+          </value>
+        </entry>
+        <entry key="ToolDefinition">
+          <value>
+            <set>
+              <option value="file://$PROJECT_DIR$/internal/toolify/toolify.go" />
             </set>
           </value>
         </entry>
@@ -245,6 +273,21 @@
             </ScannedPath>
           </value>
         </entry>
+        <entry key="file://$PROJECT_DIR$/internal/toolify/toolify.go">
+          <value>
+            <ScannedPath>
+              <option name="lastModified" value="1766023007040" />
+              <option name="schema">
+                <list>
+                  <option value="ToolDefinition" />
+                  <option value="Function" />
+                  <option value="ToolCall" />
+                  <option value="ToolCallFunction" />
+                </list>
+              </option>
+            </ScannedPath>
+          </value>
+        </entry>
       </map>
     </option>
     <option name="tableStructMapping">
@@ -262,6 +305,7 @@
         <entry key="cursor_message" value="CursorMessage" />
         <entry key="cursor_part" value="CursorPart" />
         <entry key="cursor_sse_event" value="CursorSSEEvent" />
+        <entry key="function" value="Function" />
         <entry key="message" value="Message" />
         <entry key="messages_request" value="MessagesRequest" />
         <entry key="messages_response" value="MessagesResponse" />
@@ -270,6 +314,9 @@
         <entry key="open_ai_message" value="OpenAIMessage" />
         <entry key="open_ai_usage" value="OpenAIUsage" />
         <entry key="service" value="Service" />
+        <entry key="tool_call" value="ToolCall" />
+        <entry key="tool_call_function" value="ToolCallFunction" />
+        <entry key="tool_definition" value="ToolDefinition" />
         <entry key="usage" value="Usage" />
       </map>
     </option>

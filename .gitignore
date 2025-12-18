@@ -1,0 +1,15 @@
+logs/
+*.log
+.idea/
+.vscode/
+cmd/server/main
+*.exe
+*.dll
+*.so
+*.dylib
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak
+.env
+*.local
