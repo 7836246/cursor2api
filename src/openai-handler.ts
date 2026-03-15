@@ -58,6 +58,17 @@ function convertToAnthropicRequest(body: OpenAIChatRequest): AnthropicRequest {
     const rawMessages: AnthropicMessage[] = [];
     let systemPrompt: string | undefined;
 
+    // ★ response_format 处理：构建温和的 JSON 格式提示（稍后追加到最后一条用户消息）
+    // 不用系统提示词注入（会触发模型的"社会工程攻击"检测），改为追加到用户消息末尾
+    let jsonFormatSuffix = '';
+    if (body.response_format && body.response_format.type !== 'text') {
+        jsonFormatSuffix = '\n\nRespond in plain JSON format without markdown wrapping.';
+        if (body.response_format.type === 'json_schema' && body.response_format.json_schema?.schema) {
+            jsonFormatSuffix += ` Schema: ${JSON.stringify(body.response_format.json_schema.schema)}`;
+        }
+        console.log(`[OpenAI] response_format=${body.response_format.type}, 将追加 JSON 格式提示到用户消息`);
+    }
+
     for (const msg of body.messages) {
         switch (msg.role) {
             case 'system':
@@ -124,6 +135,27 @@ function convertToAnthropicRequest(body: OpenAIChatRequest): AnthropicRequest {
 
     // 合并连续同角色消息（Anthropic API 要求 user/assistant 严格交替）
     const messages = mergeConsecutiveRoles(rawMessages);
+
+    // ★ response_format: 追加 JSON 格式提示到最后一条 user 消息
+    if (jsonFormatSuffix) {
+        for (let i = messages.length - 1; i >= 0; i--) {
+            if (messages[i].role === 'user') {
+                const content = messages[i].content;
+                if (typeof content === 'string') {
+                    messages[i].content = content + jsonFormatSuffix;
+                } else if (Array.isArray(content)) {
+                    // 找到最后一个 text block 追加
+                    const lastTextBlock = [...content].reverse().find(b => b.type === 'text');
+                    if (lastTextBlock && lastTextBlock.text) {
+                        lastTextBlock.text += jsonFormatSuffix;
+                    } else {
+                        content.push({ type: 'text', text: jsonFormatSuffix.trim() });
+                    }
+                }
+                break;
+            }
+        }
+    }
 
     // 转换工具定义：支持 OpenAI 标准格式和 Cursor 扁平格式
     const tools: AnthropicTool[] | undefined = body.tools?.map((t: OpenAITool | Record<string, unknown>) => {
@@ -512,7 +544,11 @@ async function handleOpenAIStream(
             }
         } else {
             // 无工具模式或无工具调用 — 统一清洗后发送
-            const sanitized = sanitizeResponse(fullResponse);
+            let sanitized = sanitizeResponse(fullResponse);
+            // ★ response_format 后处理：剥离 markdown 代码块包裹
+            if (body.response_format && body.response_format.type !== 'text') {
+                sanitized = stripMarkdownJsonWrapper(sanitized);
+            }
             if (sanitized) {
                 writeOpenAISSE(res, {
                     id, object: 'chat.completion.chunk', created, model,
@@ -566,7 +602,22 @@ async function handleOpenAINonStream(
 
     console.log(`[OpenAI] 非流式原始响应 (${fullText.length} chars, tools=${hasTools}): ${fullText.substring(0, 300)}${fullText.length > 300 ? '...' : ''}`);
 
-    // 拒绝检测 + 自动重试（工具模式和非工具模式均生效）
+    // ★ Thinking 提取必须在拒绝检测之前 — 否则 thinking 内容中的关键词会触发 isRefusal 误判
+    const config = getConfig();
+    const thinkingEnabled = anthropicReq.thinking?.type === 'enabled' || (anthropicReq.thinking?.type !== 'disabled' && !!config.enableThinking);
+    let reasoningContent: string | undefined;
+    if (fullText.includes('<thinking>')) {
+        const extracted = extractThinking(fullText);
+        if (extracted.thinkingBlocks.length > 0) {
+            if (thinkingEnabled) {
+                reasoningContent = extracted.thinkingBlocks.map(b => b.thinking).join('\n\n');
+            }
+            fullText = extracted.cleanText;
+            console.log(`[OpenAI] 提取 thinking 后: ${fullText.length} chars, thinking=${extracted.thinkingBlocks.reduce((s, b) => s + b.thinking.length, 0)} chars`);
+        }
+    }
+
+    // 拒绝检测 + 自动重试（在 thinking 提取之后，只检测实际输出内容）
     const shouldRetry = () => isRefusal(fullText) && !(hasTools && hasToolCalls(fullText));
 
     if (shouldRetry()) {
@@ -575,6 +626,14 @@ async function handleOpenAINonStream(
             const retryBody = buildRetryRequest(anthropicReq, attempt);
             const retryCursorReq = await convertToCursorRequest(retryBody);
             fullText = await sendCursorRequestFull(retryCursorReq);
+            // 重试响应也需要先提取 thinking
+            if (fullText.includes('<thinking>')) {
+                const ext = extractThinking(fullText);
+                fullText = ext.cleanText;
+                if (thinkingEnabled && ext.thinkingBlocks.length > 0) {
+                    reasoningContent = ext.thinkingBlocks.map(b => b.thinking).join('\n\n');
+                }
+            }
             if (!shouldRetry()) break;
         }
         if (shouldRetry()) {
@@ -594,18 +653,6 @@ async function handleOpenAINonStream(
     let content: string | null = fullText;
     let toolCalls: OpenAIToolCall[] | undefined;
     let finishReason: 'stop' | 'tool_calls' = 'stop';
-    let reasoningContent: string | undefined;
-
-    // ★ Thinking 提取：OpenAI 非流式模式下提取 <thinking> 块
-    const config = getConfig();
-    const thinkingEnabled = anthropicReq.thinking?.type === 'enabled' || (anthropicReq.thinking?.type !== 'disabled' && !!config.enableThinking);
-    if (thinkingEnabled && fullText.includes('<thinking>')) {
-        const extracted = extractThinking(fullText);
-        if (extracted.thinkingBlocks.length > 0) {
-            reasoningContent = extracted.thinkingBlocks.map(b => b.thinking).join('\n\n');
-            fullText = extracted.cleanText;
-        }
-    }
 
     if (hasTools) {
         const parsed = parseToolCalls(fullText);
@@ -639,6 +686,10 @@ async function handleOpenAINonStream(
     } else {
         // 无工具模式：清洗响应
         content = sanitizeResponse(fullText);
+        // ★ response_format 后处理：剥离 markdown 代码块包裹
+        if (body.response_format && body.response_format.type !== 'text' && content) {
+            content = stripMarkdownJsonWrapper(content);
+        }
     }
 
     const response: OpenAIChatCompletion = {
@@ -668,6 +719,22 @@ async function handleOpenAINonStream(
 }
 
 // ==================== 工具函数 ====================
+
+/**
+ * 剥离 Markdown 代码块包裹，返回裸 JSON 字符串
+ * 处理 ```json\n...\n``` 和 ```\n...\n``` 两种格式
+ */
+function stripMarkdownJsonWrapper(text: string): string {
+    if (!text) return text;
+    const trimmed = text.trim();
+    // 匹配 ```json\n...\n``` 或 ```\n...\n```
+    const match = trimmed.match(/^```(?:json)?\s*\n([\s\S]*?)\n\s*```$/); 
+    if (match) {
+        console.log(`[OpenAI] 剥离 markdown JSON 包裹: ${trimmed.length} → ${match[1].trim().length} chars`);
+        return match[1].trim();
+    }
+    return text;
+}
 
 function writeOpenAISSE(res: Response, data: OpenAIChatCompletionChunk): void {
     res.write(`data: ${JSON.stringify(data)}\n\n`);

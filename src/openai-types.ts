@@ -14,6 +14,10 @@ export interface OpenAIChatRequest {
     n?: number;
     frequency_penalty?: number;
     presence_penalty?: number;
+    response_format?: {
+        type: 'text' | 'json_object' | 'json_schema';
+        json_schema?: { name?: string; schema?: Record<string, unknown> };
+    };
 }
 
 export interface OpenAIMessage {

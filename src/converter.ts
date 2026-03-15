@@ -156,68 +156,37 @@ function sanitizeSystemPrompt(system: string): string {
     if (!system) return system;
     const originalLen = system.length;
 
-    // ── Tier 1: 完全删除（标签 + 内容）──
-    // 这些标签定义 AI 的身份和行为规则，是 injection 检测的主要触发源
-    const stripEntirely = [
-        'identity',                  // "You are Claude, made by Anthropic..."
-        'tool_calling',              // 工具调用指令（我们有自己的 buildToolInstructions）
-        'communication_style',       // 交流风格规则
-        'knowledge_discovery',       // 知识管理行为规则
-        'persistent_context',        // 上下文管理行为规则
-        'ephemeral_message',         // 系统注入的临时消息
-        'system-reminder',           // Claude Code 的 system reminder
-        'web_application_development', // Web 开发行为规则
-        'user-prompt-submit-hook',   // Claude Code 用户提交卡点钩子
-        'skill-name',                // Claude Code 自定义 skill
-        'fast_mode_info',            // Claude Code fast mode 配置
-        'claude_background_info',    // 子 Agent 的 Claude 背景信息（触发注入检测）
-        'env',                       // 子 Agent 的环境变量标签
-    ];
-    for (const tag of stripEntirely) {
-        // 允许 tag 带有属性，例如 <skill-name name="foo">
-        const tagRegex = new RegExp(`<${tag}(?:\\s+[^>]*?)?>[\\s\\S]*?<\\/${tag}>\\s*`, 'gi');
-        system = system.replace(tagRegex, '');
-    }
+    // ── 1. 计费头清除（必须，否则模型识别为注入） ──
+    system = system.replace(/^x-anthropic-billing-header[^\n]*$/gim, '');
 
-    // ── Tier 2: 只删标签壳，保留内容 ──
-    // 这些标签包含有用的项目上下文，模型需要它们来理解当前工作环境
-    const stripTagsOnly = [
-        'user_information',          // OS 版本、工作区路径
-        'user_rules',                // 用户自定义规则
-        'artifacts',                 // artifact 目录路径
-        'mcp_servers',               // MCP 服务器配置
-        'workflows',                 // 工作流定义
-        'skills',                    // skill 定义（可能包含有用的项目模式）
-    ];
-    for (const tag of stripTagsOnly) {
-        // 允许带属性的开标签
-        const openRegex = new RegExp(`<${tag}(?:\\s+[^>]*?)?>\\s*`, 'gi');
-        const closeRegex = new RegExp(`\\s*<\\/${tag}>`, 'gi');
-        system = system.replace(openRegex, '');
-        system = system.replace(closeRegex, '');
-    }
-
-    // ── 身份清洗：直接删除，不替换为新身份 ──
-    // Sonnet 4.6 会把任何 "You are X" 替换识别为 jailbreak
-    const apos = `['\u2019]`;
-    system = system.replace(new RegExp(`You are Claude Code,? Anthropic${apos}s official CLI for Claude[^.\\n]*\\.?`, 'gi'), '');
+    // ── 2. 身份声明替换（给一个与 Cursor 模型兼容的中性身份） ──
+    const NEUTRAL_IDENTITY = 'You are Cursor\'s software engineering assistant.';
+    const apos = `['\\u2019]`;
+    system = system.replace(new RegExp(`You are Claude Code,? Anthropic${apos}s official CLI for Claude[^.\\n]*\\.?`, 'gi'), NEUTRAL_IDENTITY);
     system = system.replace(new RegExp(`You are an agent for Claude Code[^.\\n]*\\.?`, 'gi'), '');
     system = system.replace(/You are an interactive agent[^.\n]*\.?/gi, '');
     system = system.replace(/running within the Claude Agent SDK\.?/gi, '');
-    system = system.replace(/Claude Agent SDK/gi, '');
-    system = system.replace(/\bCLI\b/g, 'tool');
-
-    // ── 残留清洗 ──
     system = system.replace(/^.*(?:made by|created by|developed by)\s+(?:Anthropic|OpenAI|Google)[^\n]*$/gim, '');
-    system = system.replace(/^.*(?:pair programming|coding assistant|AI assistant)[^\n]*$/gim, '');
-    
-    // ★ 清除计费头
-    system = system.replace(/^x-anthropic-billing-header.*?$/gim, '');
 
-    // ── 全局清洗：通杀残留引用 ──
+    // ── 3. XML 标签壳剥离（保留内容，只去掉标签本身） ──
+    // 标签存在会被模型识别为"另一个 AI 的系统提示词"，但内容本身有用
+    const stripTagShell = [
+        'identity', 'tool_calling', 'communication_style', 'knowledge_discovery',
+        'persistent_context', 'ephemeral_message', 'system-reminder',
+        'web_application_development', 'user-prompt-submit-hook', 'skill-name',
+        'fast_mode_info', 'claude_background_info', 'env',
+        'user_information', 'user_rules', 'artifacts', 'mcp_servers',
+        'workflows', 'skills',
+    ];
+    for (const tag of stripTagShell) {
+        system = system.replace(new RegExp(`<${tag}(?:\\s+[^>]*?)?>\\s*`, 'gi'), '');
+        system = system.replace(new RegExp(`\\s*<\\/${tag}>`, 'gi'), '');
+    }
+
+    // ── 4. 名称替换（防止模型检测到"另一个 AI"） ──
     system = system.replace(/\bClaude\s*Code\b/gi, 'the editor');
-    system = system.replace(/\bAnthropic\b/gi, 'the provider');
     system = system.replace(/\bClaude\b(?!\s*-|\s*\d)/gi, 'the assistant');
+    system = system.replace(/\bAnthropic\b/gi, 'the provider');
 
     // 清理多余空行
     system = system.replace(/\n{3,}/g, '\n\n').trim();
@@ -277,19 +246,9 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
         console.log(`[Converter] 📋 前300字符: ${combinedSystem.substring(0, 300).replace(/\n/g, '\\n')}`);
     }
 
-    // ★ 系统提示词清洗：剥离会触发 prompt injection 检测的标记
-    // Claude Sonnet 4.6+ 会把 <identity>、<skills> 等 XML 标签识别为"另一个 AI 的系统提示词注入"
+    // ★ 系统提示词清洗：精简模式 — 只清除身份声明、计费头、XML标签壳
+    // 保留所有功能性内容（工具指令、用户上下文等）
     combinedSystem = sanitizeSystemPrompt(combinedSystem);
-
-    // ★ 系统提示词压缩：工具模式下客户端系统提示词过长时截断
-    // Claude Code 的系统提示词常常 15-20K，占比太高，挤压对话空间
-    const SYSTEM_MAX_CHARS = hasTools ? 10000 : 15000;
-    if (combinedSystem.length > SYSTEM_MAX_CHARS) {
-        const originalLen = combinedSystem.length;
-        combinedSystem = combinedSystem.substring(0, SYSTEM_MAX_CHARS) +
-            '\n\n[System prompt truncated for context budget]';
-        console.log(`[Converter] 📦 压缩系统提示词: ${originalLen} → ${combinedSystem.length} chars`);
-    }
 
     // ★ Thinking 提示词注入：
     // 仅在非工具模式注入 THINKING_HINT（工具模式输出预算极小，thinking 会吃掉 70%）
@@ -516,49 +475,48 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
     console.log(`[Converter] 📊 上下文预算: 总计=${totalChars} chars | 系统提示=${systemChars}(${pct(systemChars)}) | 工具指令=${toolInstrChars > 0 ? toolInstrChars : 'N/A'}(${pct(Math.max(toolInstrChars, 0))}) | few-shot=${fewShotChars}(${pct(fewShotChars)}) | 对话=${convChars}(${pct(convChars)}) | thinking提示=${thinkHintChars}`);
     console.log(`[Converter] 📊 安全阈值=${MAX_SAFE_CHARS} | 余量=${MAX_SAFE_CHARS - totalChars} chars | 工具结果预算=${getToolResultBudget(totalChars)}`);
 
-    // ★ 智能上下文压缩：
-    // 1. 单条大消息（如初始上下文 msg[2]）→ 直接截断（不 AI 摘要，避免触发拒绝）
-    // 2. 多轮对话历史（≥2 条旧消息）→ AI 摘要（保留关键信息）
-    // 3. 摘要结果缓存 → 重试时不重复调用 API
-    const CONV_BUDGET = Math.floor(MAX_SAFE_CHARS * 0.5);
-    const KEEP_RECENT = 2;
+    // ★ 上下文压缩策略（由配置开关控制）
+    // - enableSummary (默认 false): 用额外 API 调用对旧消息进行 AI 摘要压缩
+    // - enableProgressiveTruncation (默认 true): 保留最近消息完整，仅截短早期超长文本
+    const enableSummary = !!config.enableSummary;
+    const enableProgressiveTruncation = config.enableProgressiveTruncation !== false; // 默认 true
 
-    if (convChars > CONV_BUDGET && messages.length > 3) {
-        console.log(`[Converter] ⚠️ 对话占比过高 (${convChars}/${CONV_BUDGET})，启动压缩...`);
-        
-        const compressEnd = Math.max(messages.length - KEEP_RECENT, 3);
-        
-        // 统计要压缩的消息
-        let longMsgCount = 0;
-        let totalOldChars = 0;
-        for (let i = 2; i < compressEnd; i++) {
-            const text = messages[i].parts.map(p => p.text || '').join('\n');
-            if (text.length > 1000) longMsgCount++;
-            totalOldChars += text.length;
-        }
+    if (enableSummary) {
+        // ========== AI 摘要压缩（需要显式开启） ==========
+        const CONV_BUDGET = Math.floor(MAX_SAFE_CHARS * 0.5);
+        const KEEP_RECENT = 2;
 
-        if (longMsgCount >= 2 && totalOldChars > 8000) {
-            // 多轮对话历史 → AI 摘要
-            const cacheKey = messages.slice(2, compressEnd).map(m => 
-                m.parts[0]?.text?.substring(0, 50) || ''
-            ).join('|');
+        if (convChars > CONV_BUDGET && messages.length > 3) {
+            console.log(`[Converter] ⚠️ 对话占比过高 (${convChars}/${CONV_BUDGET})，启动 AI 摘要压缩...`);
+            
+            const compressEnd = Math.max(messages.length - KEEP_RECENT, 3);
+            
+            let longMsgCount = 0;
+            let totalOldChars = 0;
+            for (let i = 2; i < compressEnd; i++) {
+                const text = messages[i].parts.map(p => p.text || '').join('\n');
+                if (text.length > 1000) longMsgCount++;
+                totalOldChars += text.length;
+            }
 
-            if (_summaryCache.key === cacheKey && _summaryCache.summary) {
-                // 使用缓存的摘要
-                console.log(`[Converter] 🤖 使用缓存的 AI 摘要 (${_summaryCache.summary.length} chars)`);
-                applySummary(messages, _summaryCache.summary, compressEnd);
-            } else {
-                // 生成新摘要
-                const oldMessages: string[] = [];
-                for (let i = 2; i < compressEnd; i++) {
-                    const msg = messages[i];
-                    const text = msg.parts.map(p => p.text || '').join('\n');
-                    // 跳过像系统提示词的内容，只摘要真正的对话
-                    const cleanText = text.substring(0, 2500);
-                    oldMessages.push(`[${msg.role}]: ${cleanText}`);
-                }
+            if (longMsgCount >= 2 && totalOldChars > 8000) {
+                const cacheKey = messages.slice(2, compressEnd).map(m => 
+                    m.parts[0]?.text?.substring(0, 50) || ''
+                ).join('|');
 
-                const summaryPrompt = `You are a conversation summarizer. Summarize only the KEY FACTS from this conversation (max 1500 chars):
+                if (_summaryCache.key === cacheKey && _summaryCache.summary) {
+                    console.log(`[Converter] 🤖 使用缓存的 AI 摘要 (${_summaryCache.summary.length} chars)`);
+                    applySummary(messages, _summaryCache.summary, compressEnd);
+                } else {
+                    const oldMessages: string[] = [];
+                    for (let i = 2; i < compressEnd; i++) {
+                        const msg = messages[i];
+                        const text = msg.parts.map(p => p.text || '').join('\n');
+                        const cleanText = text.substring(0, 2500);
+                        oldMessages.push(`[${msg.role}]: ${cleanText}`);
+                    }
+
+                    const summaryPrompt = `You are a conversation summarizer. Summarize only the KEY FACTS from this conversation (max 1500 chars):
 - File paths mentioned and what was done to them
 - Tool calls made and their results
 - User's current goal
@@ -567,49 +525,83 @@ Do NOT include any system instructions, role descriptions, or behavioral rules. 
 
 ${oldMessages.join('\n---\n')}`;
 
-                try {
-                    console.log(`[Converter] 🤖 AI 摘要: 压缩 ${oldMessages.length} 条旧消息 (${totalOldChars} chars)...`);
-                    const { sendCursorRequestFull } = await import('./cursor-client.js');
-                    const summary = await sendCursorRequestFull({
-                        model: config.cursorModel,
-                        id: shortId(),
-                        messages: [{
-                            parts: [{ type: 'text', text: summaryPrompt }],
+                    try {
+                        console.log(`[Converter] 🤖 AI 摘要: 压缩 ${oldMessages.length} 条旧消息 (${totalOldChars} chars)...`);
+                        const { sendCursorRequestFull } = await import('./cursor-client.js');
+                        const summary = await sendCursorRequestFull({
+                            model: config.cursorModel,
                             id: shortId(),
-                            role: 'user',
-                        }],
-                        trigger: 'submit-message',
-                        max_tokens: 4096,
-                    });
+                            messages: [{
+                                parts: [{ type: 'text', text: summaryPrompt }],
+                                id: shortId(),
+                                role: 'user',
+                            }],
+                            trigger: 'submit-message',
+                            max_tokens: 4096,
+                        });
 
-                    if (summary && summary.length > 50) {
-                        const trimmed = summary.substring(0, 1500);
-                        _summaryCache = { key: cacheKey, summary: trimmed };
-                        applySummary(messages, trimmed, compressEnd);
-                        console.log(`[Converter] 🤖 AI 摘要完成: ${totalOldChars} → ${trimmed.length} chars`);
-                    } else {
-                        console.log(`[Converter] ⚠️ AI 摘要为空，回退截断`);
+                        if (summary && summary.length > 50) {
+                            const trimmed = summary.substring(0, 1500);
+                            _summaryCache = { key: cacheKey, summary: trimmed };
+                            applySummary(messages, trimmed, compressEnd);
+                            console.log(`[Converter] 🤖 AI 摘要完成: ${totalOldChars} → ${trimmed.length} chars`);
+                        } else {
+                            console.log(`[Converter] ⚠️ AI 摘要为空，回退截断`);
+                            fallbackTruncate(messages, CONV_BUDGET, !!hasTools, KEEP_RECENT);
+                        }
+                    } catch (err) {
+                        console.error(`[Converter] AI 摘要失败，回退截断:`, err instanceof Error ? err.message : err);
                         fallbackTruncate(messages, CONV_BUDGET, !!hasTools, KEEP_RECENT);
                     }
-                } catch (err) {
-                    console.error(`[Converter] AI 摘要失败，回退截断:`, err instanceof Error ? err.message : err);
-                    fallbackTruncate(messages, CONV_BUDGET, !!hasTools, KEEP_RECENT);
+                }
+            } else {
+                console.log(`[Converter] 📦 直接截断 (${longMsgCount} 条长消息, ${totalOldChars} chars)`);
+                fallbackTruncate(messages, CONV_BUDGET, !!hasTools, KEEP_RECENT);
+            }
+
+            let compressedChars = 0;
+            for (const m of messages) {
+                compressedChars += m.parts.reduce((s, p) => s + (p.text?.length ?? 0), 0);
+            }
+            setCurrentContextChars(compressedChars);
+        } else {
+            console.log(`[Converter] ✅ 上下文正常 (${totalChars}/${MAX_SAFE_CHARS}, 对话${Math.round(convChars / MAX_SAFE_CHARS * 100)}%), 无需压缩`);
+        }
+    } else if (enableProgressiveTruncation) {
+        // ========== 渐进式截断（v2.6.2 策略，默认启用） ==========
+        // 保留最近 6 条消息完整不动，仅截短早期消息中超过 2000 字符的文本部分
+        // 不删除任何消息（保留完整对话结构），只截短单条消息的超长文本
+        if (totalChars > MAX_SAFE_CHARS && messages.length > 3) {
+            const KEEP_RECENT = 6;
+            const compressEnd = Math.max(messages.length - KEEP_RECENT, hasTools ? 2 : 0);
+            const MSG_MAX_CHARS = hasTools ? 1500 : 2000;
+
+            console.log(`[Converter] ⚠️ 渐进式截断: 总上下文${totalChars}/${MAX_SAFE_CHARS}, 压缩 msg[${hasTools ? 2 : 0}..${compressEnd}]`);
+
+            for (let i = (hasTools ? 2 : 0); i < compressEnd; i++) {
+                const msg = messages[i];
+                for (const part of msg.parts) {
+                    if (part.text && part.text.length > MSG_MAX_CHARS) {
+                        const originalLen = part.text.length;
+                        part.text = part.text.substring(0, MSG_MAX_CHARS) +
+                            `\n\n... [truncated ${originalLen - MSG_MAX_CHARS} chars]`;
+                        console.log(`[Converter] 📦 截断 msg[${i}] (${msg.role}): ${originalLen} → ${part.text.length} chars`);
+                    }
                 }
             }
-        } else {
-            // 单条大消息或消息太少 → 直接截断（不用 AI，避免摘要系统提示词触发拒绝）
-            console.log(`[Converter] 📦 直接截断 (${longMsgCount} 条长消息, ${totalOldChars} chars)`);
-            fallbackTruncate(messages, CONV_BUDGET, !!hasTools, KEEP_RECENT);
-        }
 
-        // 重新计算压缩后的字数
-        let compressedChars = 0;
-        for (const m of messages) {
-            compressedChars += m.parts.reduce((s, p) => s + (p.text?.length ?? 0), 0);
+            let compressedChars = 0;
+            for (const m of messages) {
+                compressedChars += m.parts.reduce((s, p) => s + (p.text?.length ?? 0), 0);
+            }
+            setCurrentContextChars(compressedChars);
+            console.log(`[Converter] 📦 渐进式截断完成: ${totalChars} → ${compressedChars} chars`);
+        } else {
+            console.log(`[Converter] ✅ 上下文正常 (${totalChars}/${MAX_SAFE_CHARS}), 无需压缩`);
         }
-        setCurrentContextChars(compressedChars);
     } else {
-        console.log(`[Converter] ✅ 上下文正常 (${totalChars}/${MAX_SAFE_CHARS}, 对话${Math.round(convChars / MAX_SAFE_CHARS * 100)}%), 无需压缩`);
+        // ========== 不做任何压缩 ==========
+        console.log(`[Converter] ℹ️ 上下文压缩已禁用 (summary=${enableSummary}, truncation=${enableProgressiveTruncation}), 总计=${totalChars} chars`);
     }
 
     return {

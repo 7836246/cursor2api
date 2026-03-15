@@ -116,6 +116,10 @@ export interface AppConfig {
     proxy?: string;
     cursorModel: string;
     enableThinking?: boolean;
+    /** AI 摘要压缩：用额外 API 调用对旧消息进行摘要压缩（质量不稳定，默认关闭） */
+    enableSummary?: boolean;
+    /** 渐进式截断：保留最近消息完整，仅截短早期超长消息（默认开启） */
+    enableProgressiveTruncation?: boolean;
     vision?: {
         enabled: boolean;
         mode: 'ocr' | 'api';

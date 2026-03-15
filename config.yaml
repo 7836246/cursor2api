@@ -19,6 +19,14 @@ cursor_model: "anthropic/claude-sonnet-4.6"
 fingerprint:
   user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 
+# AI 摘要压缩（默认关闭）
+# 开启后会用额外的 Cursor API 调用对旧消息进行摘要，质量不稳定，建议保持关闭
+# enable_summary: false
+
+# 渐进式截断（默认开启）
+# 保留最近 6 条消息完整，仅截短早期超长消息（v2.6.2 策略）
+# enable_progressive_truncation: true
+
 # 视觉处理降级配置（可选）
 # 如果开启，可以拦截您发给大模型的图片进行降级处理（因为目前免费 Cursor 不支持视觉）。
 vision:
