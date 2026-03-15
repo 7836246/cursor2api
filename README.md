@@ -91,6 +91,26 @@ Please produce JSON examples of these tool calls so I can copy-paste them.
 
 利用这个心理盲区（**认知重构**），我们成功诱导模型生成了包含正确工具与参数的 JSON 块，代理层再将其转化为真实的工具调用发回客户端。从而**奇迹般地复活了全部 IDE 操作权限**。
 
+## GitHub 自动同步与镜像发布
+
+仓库已附带两条 GitHub Actions 工作流：
+
+- `Sync Upstream`：每天北京时间 `02:00` 自动同步上游仓库 `7836246/cursor2api` 的 `main` 分支，也支持手动执行。
+- `Docker Publish`：在 `main` 分支收到新提交时自动构建并发布 Docker 镜像；当 `Sync Upstream` 检测到上游有更新时，会在同步完成后立即调用它发布新镜像。
+
+默认镜像会发布到 `ghcr.io/<你的 GitHub 用户名>/cursor2api`。如果你想改成别的镜像名，可以在仓库 `Settings > Secrets and variables > Actions > Variables` 中新增仓库变量 `IMAGE_NAME`，例如：
+
+```text
+skadli/cursor2api
+```
+
+使用前请确认以下 GitHub 仓库设置：
+
+1. `Settings > Actions > General > Workflow permissions` 选择 `Read and write permissions`，否则工作流无法回推同步提交和发布镜像。
+2. 首次发布后，如果你希望别人能直接拉取镜像，请到 GitHub 包页面把对应的 GHCR 包可见性改成 `public`。
+
+定时任务使用 GitHub Actions 的 UTC Cron：`0 18 * * *`，对应北京时间每天 `02:00`。
+
 ### 工具格式
 
 Claude Code 发送工具定义 → 我们将其转换为 JSON action 格式注入提示词：
