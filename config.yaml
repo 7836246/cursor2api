@@ -27,6 +27,11 @@ fingerprint:
 # 保留最近 6 条消息完整，仅截短早期超长消息（v2.6.2 策略）
 # enable_progressive_truncation: true
 
+# 截断说明：Cursor 后端「输出预算」与「输入长度」成反比，不是简单超限报错。
+# 输入越大（长上下文 + 多工具 + thinking），单次回复能输出的字符越少，容易在 1k～2k 字符处被截断。
+# 缓解方式：减少单次请求的上下文（本服务在总字符>42K 时会自动压缩单条消息至 12K）；或对「只写文档/总结」类请求关闭 thinking（见 enable_thinking）。
+# enable_thinking: true
+
 # 视觉处理降级配置（可选）
 # 如果开启，可以拦截您发给大模型的图片进行降级处理（因为目前免费 Cursor 不支持视觉）。
 vision:

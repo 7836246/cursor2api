@@ -85,10 +85,8 @@ export function extractThinking(text: string): ExtractThinkingResult {
 
     // ★ 后处理：清除 thinking 提取后残留的孤立反引号
     // 场景：模型输出 `<thinking>...</thinking>\n正文内容`
-    // 预处理已清除标签周围的反引号，但如果反引号和标签不相邻（如尾部反引号），
-    // 提取后 cleanText 可能变成 "正文内容`"，需要清理
-    // 只清理首尾的孤立反引号行或孤立反引号字符
-    cleanText = cleanText.replace(/^`{1,3}\s*\n/, '').replace(/\n\s*`{1,3}$/, '');
+    // 注意：不能清除后面跟语言标识符的反引号（如 ```json），那是代码块的一部分
+    cleanText = cleanText.replace(/^`{1,3}\s*\n(?!json|javascript|typescript|python|bash|sh|html|css)/i, '').replace(/\n\s*`{1,3}$/, '');
     // 处理 cleanText 整体被一对反引号包裹的情况（如 `正文内容`）
     if (/^`[^`]/.test(cleanText) && /[^`]`$/.test(cleanText) && (cleanText.match(/`/g) || []).length === 2) {
         cleanText = cleanText.substring(1, cleanText.length - 1);

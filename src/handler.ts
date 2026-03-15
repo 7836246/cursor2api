@@ -15,10 +15,12 @@ import type {
     CursorMessage,
     CursorSSEEvent,
 } from './types.js';
-import { convertToCursorRequest, parseToolCalls, hasToolCalls } from './converter.js';
+import { convertToCursorRequest, parseToolCalls, hasToolCalls, isWriteContentTruncated } from './converter.js';
 import { sendCursorRequest, sendCursorRequestFull } from './cursor-client.js';
 import { getConfig } from './config.js';
 import { extractThinking } from './thinking.js';
+import { StreamingThinkingParser } from './streaming-parser.js';
+import { StreamingToolParser } from './streaming-tool-parser.js';
 
 function msgId(): string {
     return 'msg_' + uuidv4().replace(/-/g, '').substring(0, 24);
@@ -438,6 +440,19 @@ export async function handleMessages(req: Request, res: Response): Promise<void>
 // ==================== 截断检测 ====================
 
 /**
+ * 是否因「工具调用代码块」未闭合而截断（仅此时适合用「拆分 Write/Bash」引导）
+ * 纯文本/总结被截断时应用传统续写，不应注入 Write/Bash 拆分提示
+ */
+export function isTruncatedToolOutput(text: string): boolean {
+    if (!text || text.trim().length === 0) return false;
+    const trimmed = text.trimEnd();
+    const jsonActionOpens = (trimmed.match(/```json\s+action/g) || []).length;
+    if (jsonActionOpens === 0) return false;
+    const jsonActionBlocks = trimmed.match(/```json\s+action[\s\S]*?```/g) || [];
+    return jsonActionOpens > jsonActionBlocks.length;
+}
+
+/**
  * 检测响应是否被 Cursor 上下文窗口截断
  * 截断症状：响应以句中断句结束，没有完整的句号/block 结束标志
  * 这是导致 Claude Code 频繁出现"继续"的根本原因
@@ -447,14 +462,10 @@ export function isTruncated(text: string): boolean {
     const trimmed = text.trimEnd();
 
     // ★ 核心检测：```json action 块是否未闭合（截断发生在工具调用参数中间）
-    // 这是最精确的截断检测 — 只关心实际的工具调用代码块
-    // 注意：不能简单计数所有 ``` 因为 JSON 字符串值里可能包含 markdown 反引号
     const jsonActionOpens = (trimmed.match(/```json\s+action/g) || []).length;
     if (jsonActionOpens > 0) {
-        // 从工具调用的角度检测：开始标记比闭合标记多 = 截断
         const jsonActionBlocks = trimmed.match(/```json\s+action[\s\S]*?```/g) || [];
         if (jsonActionOpens > jsonActionBlocks.length) return true;
-        // 所有 action 块都闭合了 = 没截断（即使响应文本被截断，工具调用是完整的）
         return false;
     }
 
@@ -610,332 +621,485 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
         },
     });
 
-    let fullResponse = '';
-    let sentText = '';
-    let blockIndex = 0;
-    let textBlockStarted = false;
+    const config = getConfig();
+    // ★ thinking 跟随客户端：type 优先用客户端，未指定时用服务端 config；budget_tokens 仅记录（Cursor 无此参数）
+    const clientExplicitThinking = body.thinking?.type === 'enabled';
+    const thinkingEnabled = clientExplicitThinking || (body.thinking?.type !== 'disabled' && !!config.enableThinking);
+    if (body.thinking != null && body.thinking.budget_tokens != null) {
+        console.log(`[Handler] thinking 跟随客户端: type=${body.thinking.type}, budget_tokens=${body.thinking.budget_tokens}`);
+    }
 
-    // 无工具模式：先缓冲全部响应再检测拒绝，如果是拒绝则重试
+    // ★ 分流：有工具 → 缓冲模式（需要完整响应解析工具调用 + 截断恢复）；无工具 → 真流式
+    if (hasTools) {
+        await handleStreamBuffered(res, cursorReq, body, id, model, thinkingEnabled, clientExplicitThinking);
+    } else {
+        await handleStreamTrue(res, cursorReq, body, id, model, thinkingEnabled);
+    }
+
+    res.end();
+}
+
+/**
+ * ★ 真正的流式传输（无工具模式 — Anthropic SSE 格式）
+ *
+ * 策略：
+ * 1. 缓冲完整响应用于拒绝检测
+ * 2. 非拒绝后分 chunk 流式推送（模拟真实逐词效果）
+ * 3. Thinking 标签由 StreamingThinkingParser 状态机实时处理
+ */
+async function handleStreamTrue(
+    res: Response,
+    cursorReq: CursorChatRequest,
+    body: AnthropicRequest,
+    id: string,
+    model: string,
+    thinkingEnabled: boolean,
+): Promise<void> {
     let activeCursorReq = cursorReq;
     let retryCount = 0;
 
-    // ★ Thinking 安全流式策略
-    // 问题：Anthropic API 要求 thinking blocks 在 text blocks 之前发送
-    //       但流式传输时 <thinking> 标签可能不在第一个 delta 中出现
-    //       如果先发了 text_delta 再发 thinking_delta，客户端报错：
-    //       "Mismatched content block type content_block_delta text"
-    // 方案：当 thinking 可能出现时，完全缓冲响应，让后处理统一排序
-    const config = getConfig();
-    const clientExplicitThinking = body.thinking?.type === 'enabled';
-    const thinkingMightBePresent = clientExplicitThinking || (body.thinking?.type !== 'disabled' && !!config.enableThinking);
-    // 当 thinking 可能存在时，禁止内联流式（让后处理统一排序 thinking → text）
-    const suppressInlineStream = thinkingMightBePresent;
-
-    let streamingPaused = false;
-    let thinkingSent = false; // 标记 thinking block 是否已内联发送
-    // 检测缓冲：即使 thinking 未启用，也缓冲前 N 个字符以检测意外的 <thinking> 标签
-    const DETECTION_BUFFER_SIZE = 50;
-    let detectionPhase = !suppressInlineStream; // 仅在非全缓冲模式下使用检测缓冲
-
-    const executeStream = async () => {
-        fullResponse = '';
-        streamingPaused = false;
-        thinkingSent = false;
-        detectionPhase = !suppressInlineStream;
+    // Phase 1: 收集完整响应用于拒绝检测
+    const collectFull = async (): Promise<string> => {
+        let buffer = '';
         await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
             if (event.type !== 'text-delta' || !event.delta) return;
-            fullResponse += event.delta;
+            buffer += event.delta;
+        });
+        return buffer;
+    };
 
-            // 全缓冲模式（thinking 可能存在）或重试时：只积累不转发
-            if (suppressInlineStream || retryCount > 0) return;
+    let fullResponse = await collectFull();
 
-            // 检测缓冲阶段：累积前 N 个字符以检测意外的 <thinking> 标签
-            if (detectionPhase) {
-                if (fullResponse.includes('<thinking>')) {
-                    // 意外发现 thinking 标签！切换到全缓冲模式
-                    console.log(`[Handler] 检测到意外 <thinking> 标签，切换到全缓冲模式`);
-                    detectionPhase = false;
-                    return; // 此后所有 delta 都不实时发送
+    console.log(`[Handler] 真流式原始响应 (${fullResponse.length} chars): ${fullResponse.substring(0, 200)}${fullResponse.length > 200 ? '...' : ''}`);
+
+    // 拒绝检测 + 自动重试
+    while (isRefusal(fullResponse) && retryCount < MAX_REFUSAL_RETRIES) {
+        retryCount++;
+        console.log(`[Handler] 真流式：检测到拒绝（第${retryCount}次），自动重试...`);
+        const retryBody = buildRetryRequest(body, retryCount - 1);
+        activeCursorReq = await convertToCursorRequest(retryBody);
+        fullResponse = await collectFull();
+    }
+    if (isRefusal(fullResponse)) {
+        if (isToolCapabilityQuestion(body)) {
+            fullResponse = CLAUDE_TOOLS_RESPONSE;
+        } else {
+            fullResponse = CLAUDE_IDENTITY_RESPONSE;
+        }
+    }
+
+    // Phase 2: 流式推送
+    let blockIndex = 0;
+
+    try {
+        if (thinkingEnabled && fullResponse.includes('<thinking>')) {
+            // 有 thinking：解析后先发 thinking block，再流式发 text
+            const parser = new StreamingThinkingParser();
+            let allThinking = '';
+            let allText = '';
+
+            for (let i = 0; i < fullResponse.length; i++) {
+                const result = parser.feed(fullResponse[i]);
+                if (result.thinkingComplete) {
+                    allThinking += (allThinking ? '\n\n' : '') + result.thinkingComplete;
                 }
-                if (fullResponse.length < DETECTION_BUFFER_SIZE) {
-                    return; // 继续缓冲
+                if (result.text) {
+                    allText += result.text;
                 }
-                // 检测缓冲完成，没发现 thinking → 进入正常流式模式
-                detectionPhase = false;
+            }
+            const flushed = parser.flush();
+            if (flushed.thinkingComplete) {
+                allThinking += (allThinking ? '\n\n' : '') + flushed.thinkingComplete;
+            }
+            if (flushed.text) {
+                allText += flushed.text;
             }
 
-            // 如果在检测缓冲期间发现了 thinking（上面 return 了），之后不再流式
-            if (fullResponse.includes('<thinking>')) return;
-
-            // 工具模式：检测到 ```json 后暂停实时流式
-            if (hasTools && !streamingPaused) {
-                if (fullResponse.includes('```json')) {
-                    streamingPaused = true;
-                    return;
-                }
-            }
-
-            // 正常文本流式转发（无 thinking 的情况）
-            if (!streamingPaused) {
-                const unsent = fullResponse.substring(sentText.length);
-                if (unsent) {
-                    if (!textBlockStarted) {
-                        writeSSE(res, 'content_block_start', {
-                            type: 'content_block_start', index: blockIndex,
-                            content_block: { type: 'text', text: '' },
-                        });
-                        textBlockStarted = true;
-                    }
+            // 发送 thinking block
+            if (allThinking) {
+                writeSSE(res, 'content_block_start', {
+                    type: 'content_block_start', index: blockIndex,
+                    content_block: { type: 'thinking', thinking: '' },
+                });
+                const THINK_CHUNK = 80;
+                for (let i = 0; i < allThinking.length; i += THINK_CHUNK) {
                     writeSSE(res, 'content_block_delta', {
                         type: 'content_block_delta', index: blockIndex,
-                        delta: { type: 'text_delta', text: unsent },
+                        delta: { type: 'thinking_delta', thinking: allThinking.slice(i, i + THINK_CHUNK) },
                     });
-                    sentText = fullResponse;
                 }
+                writeSSE(res, 'content_block_delta', {
+                    type: 'content_block_delta', index: blockIndex,
+                    delta: { type: 'signature_delta', signature: 'cursor2api-thinking' },
+                });
+                writeSSE(res, 'content_block_stop', {
+                    type: 'content_block_stop', index: blockIndex,
+                });
+                blockIndex++;
             }
+
+            // 流式发送 text block
+            const sanitizedText = sanitizeResponse(allText);
+            if (sanitizedText) {
+                writeSSE(res, 'content_block_start', {
+                    type: 'content_block_start', index: blockIndex,
+                    content_block: { type: 'text', text: '' },
+                });
+                const TEXT_CHUNK = 40;
+                for (let i = 0; i < sanitizedText.length; i += TEXT_CHUNK) {
+                    writeSSE(res, 'content_block_delta', {
+                        type: 'content_block_delta', index: blockIndex,
+                        delta: { type: 'text_delta', text: sanitizedText.slice(i, i + TEXT_CHUNK) },
+                    });
+                }
+                writeSSE(res, 'content_block_stop', {
+                    type: 'content_block_stop', index: blockIndex,
+                });
+                blockIndex++;
+            }
+        } else {
+            // 无 thinking：直接流式发送 text block
+            const sanitized = sanitizeResponse(fullResponse);
+            if (sanitized) {
+                writeSSE(res, 'content_block_start', {
+                    type: 'content_block_start', index: blockIndex,
+                    content_block: { type: 'text', text: '' },
+                });
+                const STREAM_CHUNK = 40;
+                for (let i = 0; i < sanitized.length; i += STREAM_CHUNK) {
+                    writeSSE(res, 'content_block_delta', {
+                        type: 'content_block_delta', index: blockIndex,
+                        delta: { type: 'text_delta', text: sanitized.slice(i, i + STREAM_CHUNK) },
+                    });
+                }
+                writeSSE(res, 'content_block_stop', {
+                    type: 'content_block_stop', index: blockIndex,
+                });
+                blockIndex++;
+            }
+        }
+
+        // message_delta + message_stop
+        writeSSE(res, 'message_delta', {
+            type: 'message_delta',
+            delta: { stop_reason: 'end_turn', stop_sequence: null },
+            usage: { output_tokens: Math.ceil(fullResponse.length / 4) },
+        });
+        writeSSE(res, 'message_stop', { type: 'message_stop' });
+
+    } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        writeSSE(res, 'error', {
+            type: 'error', error: { type: 'api_error', message },
+        });
+    }
+}
+
+/**
+ * ★ 真流式工具模式处理（有工具时使用）
+ *
+ * 架构：在 Cursor SSE 回调中实时转发给客户端
+ *   Cursor delta → ThinkingParser → ToolParser → 实时写入 SSE
+ *
+ * 流程：
+ * 1. 前 300 字符缓冲做拒绝检测，通过后 flush 并切实时转发
+ * 2. Thinking 块完成后立即发送（Anthropic 要求 thinking 在 text 前）
+ * 3. 工具 JSON 局部缓冲后立即发送 tool_use block
+ * 4. 流结束后做截断恢复 + Write 补救（补发额外 blocks）
+ * 5. 拒绝检测失败 → 重试
+ */
+async function handleStreamBuffered(
+    res: Response,
+    cursorReq: CursorChatRequest,
+    body: AnthropicRequest,
+    id: string,
+    model: string,
+    thinkingEnabled: boolean,
+    clientExplicitThinking: boolean,
+): Promise<void> {
+    const hasTools = (body.tools?.length ?? 0) > 0;
+
+    let blockIndex = 0;
+    let textBlockStarted = false;
+
+    let activeCursorReq = cursorReq;
+    let retryCount = 0;
+
+    // ==================== 辅助函数 ====================
+
+    const collectFull = async (req: CursorChatRequest): Promise<string> => {
+        let buffer = '';
+        await sendCursorRequest(req, (event: CursorSSEEvent) => {
+            if (event.type === 'text-delta' && event.delta) buffer += event.delta;
+        });
+        return buffer;
+    };
+
+    const ensureTextBlock = () => {
+        if (!textBlockStarted) {
+            writeSSE(res, 'content_block_start', {
+                type: 'content_block_start', index: blockIndex,
+                content_block: { type: 'text', text: '' },
+            });
+            textBlockStarted = true;
+        }
+    };
+
+    const sendTextDelta = (text: string) => {
+        if (!text) return;
+        ensureTextBlock();
+        writeSSE(res, 'content_block_delta', {
+            type: 'content_block_delta', index: blockIndex,
+            delta: { type: 'text_delta', text },
         });
     };
 
-    try {
-        await executeStream();
-
-        console.log(`[Handler] 原始响应 (${fullResponse.length} chars, tools=${hasTools}): ${fullResponse.substring(0, 200)}${fullResponse.length > 200 ? '...' : ''}`);
-
-        // 拒绝检测 + 自动重试（工具模式和非工具模式均生效）
-        const shouldRetryRefusal = () => {
-            if (!isRefusal(fullResponse)) return false;
-            if (hasTools && hasToolCalls(fullResponse)) return false;
-            return true;
-        };
-
-        while (shouldRetryRefusal() && retryCount < MAX_REFUSAL_RETRIES) {
-            retryCount++;
-            console.log(`[Handler] 检测到拒绝（第${retryCount}次），自动重试...原始: ${fullResponse.substring(0, 100)}`);
-            const retryBody = buildRetryRequest(body, retryCount - 1);
-            activeCursorReq = await convertToCursorRequest(retryBody);
-            await executeStream();
-            console.log(`[Handler] 重试响应 (${fullResponse.length} chars): ${fullResponse.substring(0, 200)}${fullResponse.length > 200 ? '...' : ''}`);
-        }
-
-        if (shouldRetryRefusal()) {
-            if (!hasTools) {
-                // 工具能力询问 → 返回详细能力描述；其他 → 返回身份回复
-                if (isToolCapabilityQuestion(body)) {
-                    console.log(`[Handler] 工具能力询问被拒绝，返回 Claude 能力描述`);
-                    fullResponse = CLAUDE_TOOLS_RESPONSE;
-                } else {
-                    console.log(`[Handler] 重试${MAX_REFUSAL_RETRIES}次后仍被拒绝，返回 Claude 身份回复`);
-                    fullResponse = CLAUDE_IDENTITY_RESPONSE;
-                }
-            } else {
-                // 工具模式拒绝：返回引导文本，让模型换工具继续而不是放弃
-                console.log(`[Handler] 工具模式下拒绝且无工具调用，返回工具引导文本`);
-                fullResponse = 'The previous action is unavailable in this environment. Continue the task using your other available actions (Read, Write, Bash, Edit, etc.). Do NOT give up — use alternative tools to achieve the same goal.';
-            }
-        }
-
-        // 极短响应重试（可能是连接中断）
-        if (hasTools && fullResponse.trim().length < 10 && retryCount < MAX_REFUSAL_RETRIES) {
-            retryCount++;
-            console.log(`[Handler] 响应过短 (${fullResponse.length} chars)，重试第${retryCount}次`);
-            activeCursorReq = await convertToCursorRequest(body);
-            await executeStream();
-            console.log(`[Handler] 重试响应 (${fullResponse.length} chars): ${fullResponse.substring(0, 200)}${fullResponse.length > 200 ? '...' : ''}`);
-        }
-
-        // ★ Thinking 处理：由客户端 body.thinking 参数控制，回退到服务端配置
-        const thinkingEnabled = clientExplicitThinking || (body.thinking?.type !== 'disabled' && !!config.enableThinking);
-        let thinkingBlocks: Array<{ thinking: string }> = [];
-        if (fullResponse.includes('<thinking>')) {
-            const extracted = extractThinking(fullResponse);
-            fullResponse = extracted.cleanText;
-
-            if (hasTools && !clientExplicitThinking) {
-                // 工具模式 + 客户端未明确开启：丢弃 thinking（节省输出预算）
-                const thinkingChars = extracted.thinkingBlocks.reduce((s, b) => s + b.thinking.length, 0);
-                if (thinkingChars > 0) {
-                    console.log(`[Handler] 工具模式下剥离 thinking (${thinkingChars} chars)`);
-                }
-            } else if (thinkingEnabled) {
-                // 客户端明确开启或非工具模式 + 服务端配置启用：保留 thinking
-                thinkingBlocks = extracted.thinkingBlocks;
-                console.log(`[Handler] 保留 thinking blocks (${extracted.thinkingBlocks.length} 块，来源: ${clientExplicitThinking ? '客户端请求' : '服务端配置'})`);
-            }
-        }
-
-        // 流完成后，处理完整响应
-        // ★ 阶梯式截断恢复策略（替代旧的 6 次盲目续写）
-        // Tier 1: 引导模型用 Bash heredoc/追加写入，或拆分成多个小工具调用
-        // Tier 2: 更强硬地要求拆分
-        // Tier 3: 传统续写（最后手段，最多 2 次）
-        const originalMessages = [...activeCursorReq.messages];
-        let truncationTier = 0;
-
-        while (hasTools && isTruncated(fullResponse) && truncationTier < 4) {
-            truncationTier++;
-
-            if (truncationTier <= 2) {
-                // ========== Tier 1 & 2: 工具策略引导 ==========
-                const isFirstTier = truncationTier === 1;
-                console.log(`[Handler] ⚠️ 检测到截断 (${fullResponse.length} chars)，执行 Tier ${truncationTier} 策略${isFirstTier ? '（Bash/拆分引导）' : '（强制拆分）'}...`);
-
-                const tierPrompt = isFirstTier
-                    ? `Output truncated (${fullResponse.length} chars). Do NOT use <thinking> tags. Split into smaller parts: use multiple Write calls (≤150 lines each) or Bash append (\`cat >> file << 'EOF'\`). Start with the first chunk now.`
-                    : `Still truncated (${fullResponse.length} chars). Do NOT use <thinking> tags. Use ≤80 lines per action block. Start first chunk now.`;
-
-                // 丢弃截断的响应，让模型重新用拆分策略生成
-                activeCursorReq = {
-                    ...activeCursorReq,
-                    messages: [
-                        ...originalMessages,
-                        {
-                            parts: [{ type: 'text', text: fullResponse }],
-                            id: uuidv4(),
-                            role: 'assistant',
-                        },
-                        {
-                            parts: [{ type: 'text', text: tierPrompt }],
-                            id: uuidv4(),
-                            role: 'user',
-                        },
-                    ],
-                };
-
-                // 保存截断前的原始响应，以防 Tier 响应是拒绝
-                const savedTruncatedResponse = fullResponse;
-
-                fullResponse = '';
-                await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
-                    if (event.type === 'text-delta' && event.delta) {
-                        fullResponse += event.delta;
-                    }
-                });
-
-                console.log(`[Handler] Tier ${truncationTier} 响应 (${fullResponse.length} chars): ${fullResponse.substring(0, 200)}${fullResponse.length > 200 ? '...' : ''}`);
-
-                // ★ Tier 响应拒绝检测：如果 Tier 响应是拒绝或比原始更短，恢复原始截断响应
-                if (isRefusal(fullResponse) || fullResponse.trim().length < savedTruncatedResponse.trim().length * 0.3) {
-                    console.log(`[Handler] ⚠️ Tier ${truncationTier} 响应为拒绝或退化 (${fullResponse.length} chars)，恢复原始截断响应 (${savedTruncatedResponse.length} chars)`);
-                    fullResponse = savedTruncatedResponse;
-                    break; // 放弃 Tier 策略，直接用原始截断响应 + max_tokens
-                }
-
-                // 新响应也可能有 thinking — 统一剥离
-                if (fullResponse.includes('<thinking>')) {
-                    const extracted = extractThinking(fullResponse);
-                    fullResponse = extracted.cleanText;
-                    if (thinkingEnabled) {
-                        thinkingBlocks = [...thinkingBlocks, ...extracted.thinkingBlocks];
-                    }
-                }
-
-                // 如果新响应没有截断，成功跳出
-                if (!isTruncated(fullResponse)) {
-                    console.log(`[Handler] ✅ Tier ${truncationTier} 策略成功，响应完整`);
-                    break;
-                }
-            } else {
-                // ========== Tier 3 & 4: 传统续写（最后手段） ==========
-                const continueRound = truncationTier - 2;
-                const prevLength = fullResponse.length;
-                console.log(`[Handler] ⚠️ 降级到传统续写 (第${continueRound}次，共最多2次)...`);
-
-                const anchorLength = Math.min(300, fullResponse.length);
-                const anchorText = fullResponse.slice(-anchorLength);
-
-                const continuationPrompt = `Output cut off. Last part:\n\`\`\`\n...${anchorText}\n\`\`\`\nContinue exactly from the cut-off point. No repeats. Do NOT use <thinking> tags.`;
-
-                activeCursorReq = {
-                    ...activeCursorReq,
-                    messages: [
-                        ...originalMessages,
-                        {
-                            parts: [{ type: 'text', text: fullResponse }],
-                            id: uuidv4(),
-                            role: 'assistant',
-                        },
-                        {
-                            parts: [{ type: 'text', text: continuationPrompt }],
-                            id: uuidv4(),
-                            role: 'user',
-                        },
-                    ],
-                };
-
-                let continuationResponse = '';
-                await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
-                    if (event.type === 'text-delta' && event.delta) {
-                        continuationResponse += event.delta;
-                    }
-                });
-
-                if (continuationResponse.trim().length === 0) {
-                    console.log(`[Handler] ⚠️ 续写返回空响应，停止`);
-                    break;
-                }
-
-                const deduped = deduplicateContinuation(fullResponse, continuationResponse);
-                fullResponse += deduped;
-                if (deduped.length !== continuationResponse.length) {
-                    console.log(`[Handler] 续写去重: 移除了 ${continuationResponse.length - deduped.length} chars 重复`);
-                }
-                console.log(`[Handler] 续写拼接: ${prevLength} → ${fullResponse.length} chars (+${deduped.length})`);
-
-                if (deduped.trim().length === 0) {
-                    console.log(`[Handler] ⚠️ 续写内容全部为重复，停止`);
-                    break;
-                }
-            }
-        }
-
-        // ★ 先发送 thinking 块（在 text 和 tool_use 之前）
-        // Anthropic API 要求每个响应只有一个 thinking block，合并多个块
-        if (thinkingBlocks.length > 0) {
-            const mergedThinking = thinkingBlocks.map(tb => tb.thinking).join('\n\n');
-            writeSSE(res, 'content_block_start', {
-                type: 'content_block_start', index: blockIndex,
-                content_block: { type: 'thinking', thinking: '' },
-            });
-            writeSSE(res, 'content_block_delta', {
-                type: 'content_block_delta', index: blockIndex,
-                delta: { type: 'thinking_delta', thinking: mergedThinking },
-            });
-            // 发送 signature delta（Anthropic API 要求）
-            writeSSE(res, 'content_block_delta', {
-                type: 'content_block_delta', index: blockIndex,
-                delta: { type: 'signature_delta', signature: 'cursor2api-thinking' },
-            });
+    const closeTextBlock = () => {
+        if (textBlockStarted) {
             writeSSE(res, 'content_block_stop', {
                 type: 'content_block_stop', index: blockIndex,
             });
             blockIndex++;
+            textBlockStarted = false;
+        }
+    };
+
+    const sendToolUseBlock = (name: string, args: Record<string, unknown>) => {
+        closeTextBlock();
+        const tcId = toolId();
+        writeSSE(res, 'content_block_start', {
+            type: 'content_block_start', index: blockIndex,
+            content_block: { type: 'tool_use', id: tcId, name, input: {} },
+        });
+        const inputJson = JSON.stringify(args);
+        const CHUNK_SIZE = 128;
+        for (let j = 0; j < inputJson.length; j += CHUNK_SIZE) {
+            writeSSE(res, 'content_block_delta', {
+                type: 'content_block_delta', index: blockIndex,
+                delta: { type: 'input_json_delta', partial_json: inputJson.slice(j, j + CHUNK_SIZE) },
+            });
+        }
+        writeSSE(res, 'content_block_stop', {
+            type: 'content_block_stop', index: blockIndex,
+        });
+        blockIndex++;
+    };
+
+    const sendThinkingBlock = (thinking: string) => {
+        if (!thinking) return;
+        writeSSE(res, 'content_block_start', {
+            type: 'content_block_start', index: blockIndex,
+            content_block: { type: 'thinking', thinking: '' },
+        });
+        const CHUNK = 80;
+        for (let i = 0; i < thinking.length; i += CHUNK) {
+            writeSSE(res, 'content_block_delta', {
+                type: 'content_block_delta', index: blockIndex,
+                delta: { type: 'thinking_delta', thinking: thinking.slice(i, i + CHUNK) },
+            });
+        }
+        writeSSE(res, 'content_block_delta', {
+            type: 'content_block_delta', index: blockIndex,
+            delta: { type: 'signature_delta', signature: 'cursor2api-thinking' },
+        });
+        writeSSE(res, 'content_block_stop', {
+            type: 'content_block_stop', index: blockIndex,
+        });
+        blockIndex++;
+    };
+
+    try {
+        // ==================== 流式状态 ====================
+        const REFUSAL_CHECK_CHARS = 300;
+        let fullResponse = '';           // 完整原始响应（用于截断检测）
+        let thinkingContent = '';        // 已收集的 thinking 内容
+        let thinkingSent = false;        // thinking 块是否已发送
+        let refusalCheckBuffer = '';     // 拒绝检测缓冲区（仅文本，不含 thinking）
+        let refusalCheckPassed = false;  // 拒绝检测是否已通过
+        let streamedAnything = false;    // 是否已经向客户端发送了任何内容
+        let toolCallsFound = false;      // 是否发现了工具调用
+
+        const thinkingParser = new StreamingThinkingParser();
+        const toolParser = new StreamingToolParser();
+
+        // 处理 ToolParser 产出的事件
+        const processToolEvent = (event: { type: string; text?: string; toolName?: string; toolArgs?: Record<string, unknown> }) => {
+            if (event.type === 'text' && event.text) {
+                if (!refusalCheckPassed) {
+                    // 还在拒绝检测阶段：缓冲文本
+                    refusalCheckBuffer += event.text;
+                    if (refusalCheckBuffer.length >= REFUSAL_CHECK_CHARS) {
+                        if (isRefusal(refusalCheckBuffer)) {
+                            // 拒绝！但还没发任何内容给客户端，可以重试
+                            return;
+                        }
+                        // 通过拒绝检测！flush 缓冲区（对完整缓冲区做一次 sanitize，安全）
+                        refusalCheckPassed = true;
+                        const sanitized = sanitizeResponse(refusalCheckBuffer);
+                        if (sanitized.trim()) {
+                            sendTextDelta(sanitized);
+                            streamedAnything = true;
+                        }
+                        refusalCheckBuffer = '';
+                    }
+                } else {
+                    // 已通过拒绝检测：实时转发（不做 sanitize，小 chunk 上 regex 会误判）
+                    sendTextDelta(event.text);
+                    streamedAnything = true;
+                }
+            } else if (event.type === 'tool_complete' && event.toolName) {
+                // 工具调用 = 肯定不是拒绝
+                if (!refusalCheckPassed && refusalCheckBuffer) {
+                    refusalCheckPassed = true;
+                    if (refusalCheckBuffer.trim()) {
+                        sendTextDelta(refusalCheckBuffer);
+                        streamedAnything = true;
+                    }
+                    refusalCheckBuffer = '';
+                }
+                refusalCheckPassed = true;
+                toolCallsFound = true;
+                sendToolUseBlock(event.toolName, event.toolArgs || {});
+                streamedAnything = true;
+            }
+        };
+
+        // ==================== 真流式请求 ====================
+        console.log(`[Handler] ★ 真流式工具模式开始`);
+
+        await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
+            if (event.type !== 'text-delta' || !event.delta) return;
+            fullResponse += event.delta;
+
+            // 管线：delta → ThinkingParser → ToolParser → 实时发送
+            const thinkResult = thinkingParser.feed(event.delta);
+
+            // Thinking 完成 → 立即发送 thinking block（在 text 之前）
+            if (thinkResult.thinkingComplete) {
+                thinkingContent += (thinkingContent ? '\n\n' : '') + thinkResult.thinkingComplete;
+                if (thinkingEnabled && clientExplicitThinking && !thinkingSent) {
+                    sendThinkingBlock(thinkingContent);
+                    thinkingSent = true;
+                    streamedAnything = true;
+                }
+            }
+
+            // 文本部分 → 通过 ToolParser
+            if (thinkResult.text) {
+                const toolEvents = toolParser.feed(thinkResult.text);
+                for (const te of toolEvents) {
+                    processToolEvent(te);
+                }
+            }
+        });
+
+        // Flush 解析器残余
+        const thinkFlushed = thinkingParser.flush();
+        if (thinkFlushed.thinkingComplete) {
+            thinkingContent += (thinkingContent ? '\n\n' : '') + thinkFlushed.thinkingComplete;
+            if (thinkingEnabled && clientExplicitThinking && !thinkingSent && thinkingContent) {
+                sendThinkingBlock(thinkingContent);
+                thinkingSent = true;
+                streamedAnything = true;
+            }
+        }
+        if (thinkFlushed.text) {
+            const toolEvents = toolParser.feed(thinkFlushed.text);
+            for (const te of toolEvents) processToolEvent(te);
+        }
+        const toolFlushed = toolParser.flush();
+        for (const te of toolFlushed) processToolEvent(te);
+
+        // Flush 未过检查门槛的残余缓冲（短响应 <300 chars）
+        if (!refusalCheckPassed && refusalCheckBuffer) {
+            if (isRefusal(refusalCheckBuffer)) {
+                // 整个响应都是拒绝，且没发送过任何内容 → 可以重试！
+                console.log(`[Handler] 流式模式检测到拒绝 (${fullResponse.length} chars): ${fullResponse.substring(0, 100)}`);
+            } else {
+                refusalCheckPassed = true;
+                const sanitized = sanitizeResponse(refusalCheckBuffer);
+                if (sanitized.trim()) {
+                    sendTextDelta(sanitized);
+                    streamedAnything = true;
+                }
+                refusalCheckBuffer = '';
+            }
         }
 
-        let stopReason = (hasTools && isTruncated(fullResponse)) ? 'max_tokens' : 'end_turn';
-        if (stopReason === 'max_tokens') {
-            console.log(`[Handler] ⚠️ 阶梯式恢复(${truncationTier}层)后仍截断 (${fullResponse.length} chars)，设置 stop_reason=max_tokens`);
+        console.log(`[Handler] 流式响应完成 (${fullResponse.length} chars, streamed=${streamedAnything}, tools=${toolCallsFound})`);
+
+        // ==================== 拒绝重试 ====================
+        if (!refusalCheckPassed && !streamedAnything) {
+            // 拒绝了且没发送过任何内容 → 可以安全重试
+            while (retryCount < MAX_REFUSAL_RETRIES) {
+                retryCount++;
+                console.log(`[Handler] 真流式：拒绝重试（第${retryCount}次）...`);
+                const retryBody = buildRetryRequest(body, retryCount - 1);
+                activeCursorReq = await convertToCursorRequest(retryBody);
+
+                // 重试用缓冲模式（快速判断）
+                const retryResponse = await collectFull(activeCursorReq);
+                console.log(`[Handler] 重试响应 (${retryResponse.length} chars): ${retryResponse.substring(0, 200)}${retryResponse.length > 200 ? '...' : ''}`);
+
+                if (!isRefusal(retryResponse) || (hasTools && hasToolCalls(retryResponse))) {
+                    // 重试成功！用缓冲的响应做后处理然后发送
+                    fullResponse = retryResponse;
+                    refusalCheckPassed = true;
+                    break;
+                }
+            }
+
+            if (!refusalCheckPassed) {
+                console.log(`[Handler] 重试${MAX_REFUSAL_RETRIES}次后仍被拒绝，返回简短引导`);
+                fullResponse = 'Let me proceed with the task.';
+                refusalCheckPassed = true;
+            }
+
+            // 用完整缓冲响应做后处理
+            let processedResponse = fullResponse;
+            let extraThinking = '';
+
+            if (processedResponse.includes('<thinking>')) {
+                const extracted = extractThinking(processedResponse);
+                processedResponse = extracted.cleanText;
+                if (hasTools && !clientExplicitThinking) {
+                    // 剥离
+                } else if (thinkingEnabled) {
+                    extraThinking = extracted.thinkingBlocks.map(tb => tb.thinking).join('\n\n');
+                }
+            }
+
+            // 发送 thinking
+            if (extraThinking && !thinkingSent) {
+                sendThinkingBlock(extraThinking);
+            }
+
+            // 解析并发送
+            const { toolCalls, cleanText } = parseToolCalls(processedResponse);
+            if (toolCalls.length > 0) {
+                toolCallsFound = true;
+                let safeText = cleanText;
+                if (REFUSAL_PATTERNS.some(p => p.test(safeText))) safeText = '';
+                if (safeText.trim()) sendTextDelta(safeText);
+                closeTextBlock();
+                for (const tc of toolCalls) sendToolUseBlock(tc.name, tc.arguments);
+            } else {
+                sendTextDelta(processedResponse);
+            }
         }
 
-        if (hasTools) {
-            let { toolCalls, cleanText } = parseToolCalls(fullResponse);
-
-            // ★ tool_choice=any 强制重试：如果模型没有输出任何工具调用块，追加强制消息重试
-            const toolChoice = body.tool_choice;
+        // ==================== tool_choice=any 强制（仅缓冲模式回退） ====================
+        const toolChoice = body.tool_choice;
+        if (toolChoice?.type === 'any' && !toolCallsFound) {
             const TOOL_CHOICE_MAX_RETRIES = 2;
             let toolChoiceRetry = 0;
-            while (
-                toolChoice?.type === 'any' &&
-                toolCalls.length === 0 &&
-                toolChoiceRetry < TOOL_CHOICE_MAX_RETRIES
-            ) {
+            while (toolChoiceRetry < TOOL_CHOICE_MAX_RETRIES) {
                 toolChoiceRetry++;
-                console.log(`[Handler] tool_choice=any 但模型未调用工具（第${toolChoiceRetry}次），强制重试...`);
-
-                // 在现有 Cursor 请求中追加强制 user 消息（不重新转换整个请求，代价最小）
+                console.log(`[Handler] tool_choice=any 但无工具（第${toolChoiceRetry}次），强制重试...`);
                 const forceMsg: CursorMessage = {
                     parts: [{
                         type: 'text',
-                        text: `Your last response did not include any \`\`\`json action block. This is required because tool_choice is "any". You MUST respond using the json action format for at least one action. Do not explain yourself — just output the action block now.`,
+                        text: `Your last response did not include any \`\`\`json action block. This is required because tool_choice is "any". You MUST respond using the json action format for at least one action.`,
                     }],
                     id: uuidv4(),
                     role: 'user',
@@ -948,140 +1112,68 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
                         role: 'assistant',
                     }, forceMsg],
                 };
-                await executeStream();
-                ({ toolCalls, cleanText } = parseToolCalls(fullResponse));
-            }
-            if (toolChoice?.type === 'any' && toolCalls.length === 0) {
-                console.log(`[Handler] tool_choice=any 重试${TOOL_CHOICE_MAX_RETRIES}次后仍无工具调用`);
-            }
-
-
-            if (toolCalls.length > 0) {
-                stopReason = 'tool_use';
-
-                // Check if the residual text is a known refusal, if so, drop it completely!
-                if (REFUSAL_PATTERNS.some(p => p.test(cleanText))) {
-                    console.log(`[Handler] Supressed refusal text generated during tool usage: ${cleanText.substring(0, 100)}...`);
-                    cleanText = '';
+                const retryResp = await collectFull(activeCursorReq);
+                const { toolCalls } = parseToolCalls(retryResp);
+                if (toolCalls.length > 0) {
+                    for (const tc of toolCalls) sendToolUseBlock(tc.name, tc.arguments);
+                    toolCallsFound = true;
+                    fullResponse = retryResp;
+                    break;
                 }
-
-                // Any clean text is sent as a single block before the tool blocks
-                const unsentCleanText = cleanText.substring(sentText.length).trim();
-
-                if (unsentCleanText) {
-                    if (!textBlockStarted) {
-                        writeSSE(res, 'content_block_start', {
-                            type: 'content_block_start', index: blockIndex,
-                            content_block: { type: 'text', text: '' },
-                        });
-                        textBlockStarted = true;
-                    }
-                    writeSSE(res, 'content_block_delta', {
-                        type: 'content_block_delta', index: blockIndex,
-                        delta: { type: 'text_delta', text: (sentText && !sentText.endsWith('\n') ? '\n' : '') + unsentCleanText }
-                    });
-                }
-
-                if (textBlockStarted) {
-                    writeSSE(res, 'content_block_stop', {
-                        type: 'content_block_stop', index: blockIndex,
-                    });
-                    blockIndex++;
-                    textBlockStarted = false;
-                }
-
-                for (const tc of toolCalls) {
-                    const tcId = toolId();
-                    writeSSE(res, 'content_block_start', {
-                        type: 'content_block_start',
-                        index: blockIndex,
-                        content_block: { type: 'tool_use', id: tcId, name: tc.name, input: {} },
-                    });
-
-                    // 增量发送 input_json_delta（模拟 Anthropic 原生流式）
-                    const inputJson = JSON.stringify(tc.arguments);
-                    const CHUNK_SIZE = 128;
-                    for (let j = 0; j < inputJson.length; j += CHUNK_SIZE) {
-                        writeSSE(res, 'content_block_delta', {
-                            type: 'content_block_delta',
-                            index: blockIndex,
-                            delta: { type: 'input_json_delta', partial_json: inputJson.slice(j, j + CHUNK_SIZE) },
-                        });
-                    }
-
-                    writeSSE(res, 'content_block_stop', {
-                        type: 'content_block_stop', index: blockIndex,
-                    });
-                    blockIndex++;
-                }
-            } else {
-                // False alarm! The tool triggers were just normal text. 
-                // We must send the remaining unsent fullResponse.
-                let textToSend = fullResponse;
-
-                // ★ 仅对短响应或开头明确匹配拒绝模式的响应进行压制
-                // 长响应（如模型在写报告）中可能碰巧包含某个宽泛的拒绝关键词，不应被误判
-                // 截断响应（stopReason=max_tokens）一定不是拒绝
-                const isShortResponse = fullResponse.trim().length < 500;
-                const startsWithRefusal = isRefusal(fullResponse.substring(0, 300));
-                const isActualRefusal = stopReason !== 'max_tokens' && (isShortResponse ? isRefusal(fullResponse) : startsWithRefusal);
-
-                if (isActualRefusal) {
-                    console.log(`[Handler] Supressed complete refusal without tools: ${fullResponse.substring(0, 100)}...`);
-                    textToSend = 'The previous action is unavailable. Continue using other available actions to complete the task.';
-                }
-
-                const unsentText = textToSend.substring(sentText.length);
-                if (unsentText) {
-                    if (!textBlockStarted) {
-                        writeSSE(res, 'content_block_start', {
-                            type: 'content_block_start', index: blockIndex,
-                            content_block: { type: 'text', text: '' },
-                        });
-                        textBlockStarted = true;
-                    }
-                    writeSSE(res, 'content_block_delta', {
-                        type: 'content_block_delta', index: blockIndex,
-                        delta: { type: 'text_delta', text: unsentText },
-                    });
-                }
-            }
-        } else {
-            // 无工具模式后处理
-            // 最后一道防线：清洗所有 Cursor 身份引用
-            const sanitized = sanitizeResponse(fullResponse);
-            // 实时流已发送的部分不再重复发送
-            const unsent = sentText ? (sanitized.length > sentText.length ? sanitized.substring(sentText.length) : '') : sanitized;
-            if (unsent) {
-                if (!textBlockStarted) {
-                    writeSSE(res, 'content_block_start', {
-                        type: 'content_block_start', index: blockIndex,
-                        content_block: { type: 'text', text: '' },
-                    });
-                    textBlockStarted = true;
-                }
-                writeSSE(res, 'content_block_delta', {
-                    type: 'content_block_delta', index: blockIndex,
-                    delta: { type: 'text_delta', text: unsent },
-                });
             }
         }
 
-        // 结束文本块（如果还没结束）
-        if (textBlockStarted) {
-            writeSSE(res, 'content_block_stop', {
-                type: 'content_block_stop', index: blockIndex,
-            });
-            blockIndex++;
+        // ==================== 截断恢复（流结束后） ====================
+        if (hasTools && isTruncated(fullResponse)) {
+            console.log(`[Handler] ⚠️ 流式响应截断 (${fullResponse.length} chars)，开始续写恢复...`);
+            const originalMessages = [...activeCursorReq.messages];
+            let continueCount = 0;
+            const MAX_AUTO_CONTINUE = 10;
+
+            while (isTruncated(fullResponse) && continueCount < MAX_AUTO_CONTINUE) {
+                continueCount++;
+                const anchorLength = Math.min(300, fullResponse.length);
+                const anchorText = fullResponse.slice(-anchorLength);
+                const continuationPrompt = `Your previous response was cut off mid-output. The last part was:\n\n\`\`\`\n...${anchorText}\n\`\`\`\n\nContinue EXACTLY from where you stopped. DO NOT repeat content. Output ONLY the remaining part.`;
+                const contReq = {
+                    ...activeCursorReq,
+                    messages: [
+                        ...originalMessages,
+                        { parts: [{ type: 'text', text: fullResponse }], id: uuidv4(), role: 'assistant' },
+                        { parts: [{ type: 'text', text: continuationPrompt }], id: uuidv4(), role: 'user' },
+                    ],
+                };
+                const continuation = await collectFull(contReq);
+                if (continuation.trim().length === 0) break;
+
+                const deduped = deduplicateContinuation(fullResponse, continuation);
+                fullResponse += deduped;
+
+                // 续写部分也要解析并发送
+                const { toolCalls: contToolCalls, cleanText: contCleanText } = parseToolCalls(deduped);
+                if (contCleanText.trim()) sendTextDelta(contCleanText);
+                for (const tc of contToolCalls) {
+                    sendToolUseBlock(tc.name, tc.arguments);
+                    toolCallsFound = true;
+                }
+
+                console.log(`[Handler] 续写拼接 +${deduped.length} chars → ${fullResponse.length} chars`);
+                if (deduped.trim().length === 0) break;
+            }
         }
 
-        // 发送 message_delta + message_stop
+        // ==================== 结束 ====================
+        closeTextBlock();
+
+        const stopReason = toolCallsFound ? 'tool_use'
+            : (hasTools && isTruncated(fullResponse)) ? 'max_tokens'
+            : 'end_turn';
+
         writeSSE(res, 'message_delta', {
             type: 'message_delta',
             delta: { stop_reason: stopReason, stop_sequence: null },
             usage: { output_tokens: Math.ceil(fullResponse.length / 4) },
         });
-
         writeSSE(res, 'message_stop', { type: 'message_stop' });
 
     } catch (err: unknown) {
@@ -1090,11 +1182,7 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
             type: 'error', error: { type: 'api_error', message },
         });
     }
-
-    res.end();
 }
-
-// ==================== 非流式处理 ====================
 
 async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body: AnthropicRequest): Promise<void> {
     let fullText = await sendCursorRequestFull(cursorReq);
@@ -1142,6 +1230,9 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
     const config = getConfig();
     const clientExplicitThinking = body.thinking?.type === 'enabled';
     const thinkingEnabled = clientExplicitThinking || (body.thinking?.type !== 'disabled' && !!config.enableThinking);
+    if (body.thinking != null && body.thinking.budget_tokens != null) {
+        console.log(`[Handler] 非流式 thinking 跟随客户端: type=${body.thinking.type}, budget_tokens=${body.thinking.budget_tokens}`);
+    }
     let thinkingBlocks: Array<{ thinking: string }> = [];
     if (fullText.includes('<thinking>')) {
         const extracted = extractThinking(fullText);
@@ -1157,24 +1248,25 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
         }
     }
 
-    // ★ 阶梯式截断恢复（与流式路径对齐）
-    // Tier 1: Bash/拆分引导  Tier 2: 强制拆分  Tier 3-4: 传统续写
+    // ★ 截断恢复策略（与流式路径对齐）
+    const MAX_AUTO_CONTINUE = 10;
+    let continueCount = 0;
+    let splitAttempted = false;
     const originalMessages = [...activeCursorReq.messages];
-    let truncationTier = 0;
 
-    while (hasTools && isTruncated(fullText) && truncationTier < 4) {
-        truncationTier++;
+    while (hasTools && isTruncated(fullText) && continueCount < MAX_AUTO_CONTINUE) {
+        continueCount++;
+        const prevLength = fullText.length;
+        const truncatedToolOutput = isTruncatedToolOutput(fullText);
 
-        if (truncationTier <= 2) {
-            // ========== Tier 1 & 2: 工具策略引导 ==========
-            const isFirstTier = truncationTier === 1;
-            console.log(`[Handler] ⚠️ 非流式：检测到截断 (${fullText.length} chars)，执行 Tier ${truncationTier} 策略${isFirstTier ? '（Bash/拆分引导）' : '（强制拆分）'}...`);
+        // ★ 仅当截断的是未闭合的 ```json action 时用拆分策略；纯文本截断用传统续写
+        if (!splitAttempted && truncatedToolOutput) {
+            splitAttempted = true;
+            console.log(`[Handler] ⚠️ 非流式：检测到截断 (${fullText.length} chars，工具输出未闭合)，引导模型拆分输出...`);
 
-            const tierPrompt = isFirstTier
-                ? `Output truncated (${fullText.length} chars). Split into smaller parts: use multiple Write calls (≤150 lines each) or Bash append (\`cat >> file << 'EOF'\`). Start with the first chunk now.`
-                : `Still truncated (${fullText.length} chars). Use ≤80 lines per action block. Start first chunk now.`;
+            const splitPrompt = `Output truncated (${fullText.length} chars). Split into smaller parts: use multiple Write calls (≤150 lines each) or Bash append (\`cat >> file << 'EOF'\`). Start with the first chunk now.`;
 
-            const tierReq: CursorChatRequest = {
+            const splitReq: CursorChatRequest = {
                 ...activeCursorReq,
                 messages: [
                     ...originalMessages,
@@ -1184,85 +1276,87 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
                         role: 'assistant',
                     },
                     {
-                        parts: [{ type: 'text', text: tierPrompt }],
+                        parts: [{ type: 'text', text: splitPrompt }],
                         id: uuidv4(),
                         role: 'user',
                     },
                 ],
             };
 
-            const savedTruncatedText = fullText;
+            const savedText = fullText;
+            fullText = await sendCursorRequestFull(splitReq);
 
-            fullText = await sendCursorRequestFull(tierReq);
-            console.log(`[Handler] 非流式 Tier ${truncationTier} 响应 (${fullText.length} chars): ${fullText.substring(0, 200)}${fullText.length > 200 ? '...' : ''}`);
+            console.log(`[Handler] 非流式拆分策略响应 (${fullText.length} chars): ${fullText.substring(0, 200)}${fullText.length > 200 ? '...' : ''}`);
 
-            // ★ 拒绝检测：如果 Tier 响应是拒绝或退化，恢复原始
-            if (isRefusal(fullText) || fullText.trim().length < savedTruncatedText.trim().length * 0.3) {
-                console.log(`[Handler] ⚠️ 非流式 Tier ${truncationTier} 响应为拒绝或退化，恢复原始截断响应`);
-                fullText = savedTruncatedText;
-                break;
+            if (isRefusal(fullText) || fullText.trim().length < savedText.trim().length * 0.3) {
+                console.log(`[Handler] ⚠️ 非流式拆分策略失败，降级到传统续写`);
+                fullText = savedText;
+                continue;
             }
 
-            // 新响应也可能有 thinking — 统一剥离
             if (fullText.includes('<thinking>')) {
                 const extracted = extractThinking(fullText);
                 fullText = extracted.cleanText;
-                // 工具模式下丢弃 thinking，非工具模式保留
                 if (thinkingEnabled) {
                     thinkingBlocks = [...thinkingBlocks, ...extracted.thinkingBlocks];
                 }
             }
 
             if (!isTruncated(fullText)) {
-                console.log(`[Handler] ✅ 非流式 Tier ${truncationTier} 策略成功，响应完整`);
+                console.log(`[Handler] ✅ 非流式拆分策略成功，响应完整`);
                 break;
             }
-        } else {
-            // ========== Tier 3 & 4: 传统续写（最后手段） ==========
-            const continueRound = truncationTier - 2;
-            const prevLength = fullText.length;
-            console.log(`[Handler] ⚠️ 非流式：降级到传统续写 (第${continueRound}次，共最多2次)...`);
+            continue;
+        }
 
-            const anchorLength = Math.min(300, fullText.length);
-            const anchorText = fullText.slice(-anchorLength);
+        if (!splitAttempted) splitAttempted = true;
+        console.log(`[Handler] ⚠️ 非流式：检测到截断 (${fullText.length} chars)，传统续写 (第${continueCount}次)...`);
 
-            const continuationPrompt = `Output cut off. Last part:\n\`\`\`\n...${anchorText}\n\`\`\`\nContinue exactly from the cut-off point. No repeats.`;
+        const anchorLength = Math.min(300, fullText.length);
+        const anchorText = fullText.slice(-anchorLength);
 
-            const continuationReq: CursorChatRequest = {
-                ...activeCursorReq,
-                messages: [
-                    ...originalMessages,
-                    {
-                        parts: [{ type: 'text', text: fullText }],
-                        id: uuidv4(),
-                        role: 'assistant',
-                    },
-                    {
-                        parts: [{ type: 'text', text: continuationPrompt }],
-                        id: uuidv4(),
-                        role: 'user',
-                    },
-                ],
-            };
+        const continuationPrompt = `Your previous response was cut off mid-output. The last part of your output was:
 
-            const continuationResponse = await sendCursorRequestFull(continuationReq);
+\`\`\`
+...${anchorText}
+\`\`\`
 
-            if (continuationResponse.trim().length === 0) {
-                console.log(`[Handler] ⚠️ 非流式续写返回空响应，停止`);
-                break;
-            }
+Continue EXACTLY from where you stopped. DO NOT repeat any content already generated. DO NOT restart the response. Output ONLY the remaining content, starting immediately from the cut-off point.`;
 
-            const deduped = deduplicateContinuation(fullText, continuationResponse);
-            fullText += deduped;
-            if (deduped.length !== continuationResponse.length) {
-                console.log(`[Handler] 非流式续写去重: 移除了 ${continuationResponse.length - deduped.length} chars 重复`);
-            }
-            console.log(`[Handler] 非流式续写拼接: ${prevLength} → ${fullText.length} chars (+${deduped.length})`);
+        const continuationReq: CursorChatRequest = {
+            ...activeCursorReq,
+            messages: [
+                ...originalMessages,
+                {
+                    parts: [{ type: 'text', text: fullText }],
+                    id: uuidv4(),
+                    role: 'assistant',
+                },
+                {
+                    parts: [{ type: 'text', text: continuationPrompt }],
+                    id: uuidv4(),
+                    role: 'user',
+                },
+            ],
+        };
 
-            if (deduped.trim().length === 0) {
-                console.log(`[Handler] ⚠️ 非流式续写内容全部为重复，停止`);
-                break;
-            }
+        const continuationResponse = await sendCursorRequestFull(continuationReq);
+
+        if (continuationResponse.trim().length === 0) {
+            console.log(`[Handler] ⚠️ 非流式续写返回空响应，停止续写`);
+            break;
+        }
+
+        const deduped = deduplicateContinuation(fullText, continuationResponse);
+        fullText += deduped;
+        if (deduped.length !== continuationResponse.length) {
+            console.log(`[Handler] 非流式续写去重: 移除了 ${continuationResponse.length - deduped.length} chars 的重复内容`);
+        }
+        console.log(`[Handler] 非流式续写拼接完成: ${prevLength} → ${fullText.length} chars (+${deduped.length})`);
+
+        if (deduped.trim().length === 0) {
+            console.log(`[Handler] ⚠️ 非流式续写内容全部为重复，停止续写`);
+            break;
         }
     }
 
@@ -1322,6 +1416,41 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
             console.log(`[Handler] 非流式：tool_choice=any 重试${TOOL_CHOICE_MAX_RETRIES}次后仍无工具调用`);
         }
 
+        // ★ Write content 截断补救（与流式路径一致）
+        const truncatedWriteNonStream = toolCalls.find((tc): tc is typeof tc & { arguments: { file_path?: string; content?: string } } =>
+            isWriteContentTruncated(tc));
+        if (truncatedWriteNonStream && originalMessages) {
+            const filePath = (truncatedWriteNonStream.arguments?.file_path ?? truncatedWriteNonStream.arguments?.path ?? '666.md') as string;
+            const writeContinuationPrompt = `Your previous response was cut off while writing the \`content\` parameter for the Write tool (file: ${filePath}). Output ONLY the continuation of that content string from the exact character where you stopped. Then close the JSON with }\n}\n\`\`\`. No new \`\`\`json block, no explanation, no other text.`;
+            const writeContReq: CursorChatRequest = {
+                ...activeCursorReq,
+                messages: [
+                    ...originalMessages,
+                    { parts: [{ type: 'text', text: fullText }], id: uuidv4(), role: 'assistant' },
+                    { parts: [{ type: 'text', text: writeContinuationPrompt }], id: uuidv4(), role: 'user' },
+                ],
+            };
+            let writeContinuation = await sendCursorRequestFull(writeContReq);
+            if (writeContinuation.trim().length > 0) {
+                if (writeContinuation.includes('<thinking>')) {
+                    const ex = extractThinking(writeContinuation);
+                    if (thinkingEnabled && ex.thinkingBlocks.length > 0) {
+                        thinkingBlocks = thinkingBlocks.concat(ex.thinkingBlocks);
+                        const merged = thinkingBlocks.map(tb => tb.thinking).join('\n\n');
+                        const first = contentBlocks[0];
+                        if (first?.type === 'thinking') first.thinking = merged;
+                        console.log(`[Handler] 非流式 Write 续写 thinking 已合并 (${ex.thinkingBlocks.length} 块)`);
+                    }
+                    writeContinuation = ex.cleanText;
+                }
+                const append = writeContinuation.replace(/\}\s*\}\s*`{3}\s*$/s, '').trim();
+                const prev = (truncatedWriteNonStream.arguments.content ?? truncatedWriteNonStream.arguments.text ?? '') as string;
+                truncatedWriteNonStream.arguments.content = prev + append;
+                if (truncatedWriteNonStream.arguments.text !== undefined) truncatedWriteNonStream.arguments.text = truncatedWriteNonStream.arguments.content;
+                console.log(`[Handler] ✅ 非流式 Write content 截断补救: 续写合并 +${append.length} chars`);
+            }
+        }
+
         if (toolCalls.length > 0) {
             stopReason = 'tool_use';
 
@@ -1350,7 +1479,7 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
             const isRealRefusal = stopReason !== 'max_tokens' && (isShort ? isRefusal(fullText) : startsRefusal);
             if (isRealRefusal) {
                 console.log(`[Handler] Supressed pure text refusal (non-stream): ${fullText.substring(0, 100)}...`);
-                textToSend = 'The previous action is unavailable in this environment. Continue the task using your other available actions (Read, Write, Bash, Edit, etc.). Do NOT give up — use alternative tools to achieve the same goal.';
+                textToSend = 'Let me proceed with the task.';
             }
             contentBlocks.push({ type: 'text', text: textToSend });
         }

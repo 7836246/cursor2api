@@ -28,6 +28,7 @@ import { convertToCursorRequest, parseToolCalls, hasToolCalls } from './converte
 import { sendCursorRequest, sendCursorRequestFull } from './cursor-client.js';
 import { getConfig } from './config.js';
 import { extractThinking } from './thinking.js';
+import { StreamingThinkingParser } from './streaming-parser.js';
 import {
     isRefusal,
     sanitizeResponse,
@@ -385,12 +386,224 @@ async function handleOpenAIStream(
         }],
     });
 
-    let fullResponse = '';
-    let sentText = '';
+    const config = getConfig();
+    const thinkingEnabled = anthropicReq.thinking?.type === 'enabled' || (anthropicReq.thinking?.type !== 'disabled' && !!config.enableThinking);
+
+    // ★ 分流：有工具 → 缓冲模式（需要完整响应解析工具调用）；无工具 → 真流式
+    if (hasTools) {
+        await handleOpenAIStreamBuffered(res, cursorReq, body, anthropicReq, id, created, model, thinkingEnabled);
+    } else {
+        await handleOpenAIStreamTrue(res, cursorReq, body, anthropicReq, id, created, model, thinkingEnabled);
+    }
+
+    res.end();
+}
+
+/**
+ * ★ 真正的流式传输（无工具模式）
+ *
+ * 策略：
+ * 1. 初始阶段：缓冲前 REFUSAL_CHECK_SIZE 个字符，用于拒绝检测
+ * 2. 如果检测到拒绝：重试（最多 MAX_REFUSAL_RETRIES 次）
+ * 3. 如果未拒绝：立即刷出缓冲内容，后续每个 chunk 实时推送
+ * 4. Thinking 标签由 StreamingThinkingParser 状态机实时处理
+ */
+async function handleOpenAIStreamTrue(
+    res: Response,
+    cursorReq: CursorChatRequest,
+    body: OpenAIChatRequest,
+    anthropicReq: AnthropicRequest,
+    id: string,
+    created: number,
+    model: string,
+    thinkingEnabled: boolean,
+): Promise<void> {
+    const REFUSAL_CHECK_SIZE = 300;
     let activeCursorReq = cursorReq;
     let retryCount = 0;
 
-    // 统一缓冲模式：先缓冲全部响应，再检测拒绝和处理
+    // ---- Phase 1: 拒绝检测（缓冲初始内容）----
+    let initialBuffer = '';
+    let streamRemainder: string[] = []; // 超过 REFUSAL_CHECK_SIZE 的 chunks
+    let refusalCheckDone = false;
+
+    const collectForRefusalCheck = async (): Promise<string> => {
+        initialBuffer = '';
+        streamRemainder = [];
+        refusalCheckDone = false;
+        return new Promise<string>((resolve, reject) => {
+            sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
+                if (event.type !== 'text-delta' || !event.delta) return;
+                if (!refusalCheckDone) {
+                    initialBuffer += event.delta;
+                    if (initialBuffer.length >= REFUSAL_CHECK_SIZE) {
+                        refusalCheckDone = true;
+                    }
+                } else {
+                    streamRemainder.push(event.delta);
+                }
+            }).then(() => resolve(initialBuffer + streamRemainder.join(''))).catch(reject);
+        });
+    };
+
+    let fullResponse = await collectForRefusalCheck();
+
+    console.log(`[OpenAI] 真流式原始响应 (${fullResponse.length} chars): ${fullResponse.substring(0, 200)}${fullResponse.length > 200 ? '...' : ''}`);
+
+    // 拒绝检测 + 自动重试
+    while (isRefusal(fullResponse) && retryCount < MAX_REFUSAL_RETRIES) {
+        retryCount++;
+        console.log(`[OpenAI] 真流式：检测到拒绝（第${retryCount}次），自动重试...`);
+        const retryBody = buildRetryRequest(anthropicReq, retryCount - 1);
+        activeCursorReq = await convertToCursorRequest(retryBody);
+        fullResponse = await collectForRefusalCheck();
+    }
+    if (isRefusal(fullResponse)) {
+        if (isToolCapabilityQuestion(anthropicReq)) {
+            fullResponse = CLAUDE_TOOLS_RESPONSE;
+        } else {
+            fullResponse = CLAUDE_IDENTITY_RESPONSE;
+        }
+    }
+
+    // ---- Phase 2: 已有完整 fullResponse，真流式推送 ----
+    // 此时 fullResponse 包含完整的、非拒绝的响应内容
+
+    try {
+        // Thinking 处理 + 流式输出
+        if (thinkingEnabled && fullResponse.includes('<thinking>')) {
+            // 有 thinking 标签：使用 StreamingThinkingParser 逐字处理
+            const parser = new StreamingThinkingParser();
+            let allReasoningContent = '';
+
+            for (let i = 0; i < fullResponse.length; i++) {
+                const result = parser.feed(fullResponse[i]);
+                if (result.thinkingComplete) {
+                    allReasoningContent += (allReasoningContent ? '\n\n' : '') + result.thinkingComplete;
+                }
+                if (result.text) {
+                    // 先发送已积累的 reasoning_content（在第一个文本出现之前）
+                    if (allReasoningContent) {
+                        writeOpenAISSE(res, {
+                            id, object: 'chat.completion.chunk', created, model,
+                            choices: [{
+                                index: 0,
+                                delta: { reasoning_content: allReasoningContent },
+                                finish_reason: null,
+                            }],
+                        });
+                        allReasoningContent = '';
+                    }
+                    const sanitized = sanitizeResponse(result.text);
+                    if (sanitized) {
+                        writeOpenAISSE(res, {
+                            id, object: 'chat.completion.chunk', created, model,
+                            choices: [{
+                                index: 0,
+                                delta: { content: sanitized },
+                                finish_reason: null,
+                            }],
+                        });
+                    }
+                }
+            }
+
+            // 刷出剩余
+            const flushed = parser.flush();
+            if (flushed.thinkingComplete) {
+                allReasoningContent += (allReasoningContent ? '\n\n' : '') + flushed.thinkingComplete;
+            }
+            if (allReasoningContent) {
+                writeOpenAISSE(res, {
+                    id, object: 'chat.completion.chunk', created, model,
+                    choices: [{
+                        index: 0,
+                        delta: { reasoning_content: allReasoningContent },
+                        finish_reason: null,
+                    }],
+                });
+            }
+            if (flushed.text) {
+                const sanitized = sanitizeResponse(flushed.text);
+                if (sanitized) {
+                    writeOpenAISSE(res, {
+                        id, object: 'chat.completion.chunk', created, model,
+                        choices: [{
+                            index: 0,
+                            delta: { content: sanitized },
+                            finish_reason: null,
+                        }],
+                    });
+                }
+            }
+        } else {
+            // 无 thinking：直接以适当大小的 chunk 发送（模拟真实流式效果）
+            let sanitized = sanitizeResponse(fullResponse);
+            if (body.response_format && body.response_format.type !== 'text') {
+                sanitized = stripMarkdownJsonWrapper(sanitized);
+            }
+            if (sanitized) {
+                // 分 chunk 发送，每 chunk 约 20-80 字符，模拟真实逐词流式
+                const STREAM_CHUNK_SIZE = 40;
+                for (let i = 0; i < sanitized.length; i += STREAM_CHUNK_SIZE) {
+                    const chunk = sanitized.slice(i, i + STREAM_CHUNK_SIZE);
+                    writeOpenAISSE(res, {
+                        id, object: 'chat.completion.chunk', created, model,
+                        choices: [{
+                            index: 0,
+                            delta: { content: chunk },
+                            finish_reason: null,
+                        }],
+                    });
+                }
+            }
+        }
+
+        // 发送完成 chunk
+        writeOpenAISSE(res, {
+            id, object: 'chat.completion.chunk', created, model,
+            choices: [{
+                index: 0,
+                delta: {},
+                finish_reason: 'stop',
+            }],
+        });
+        res.write('data: [DONE]\n\n');
+
+    } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        writeOpenAISSE(res, {
+            id, object: 'chat.completion.chunk', created, model,
+            choices: [{
+                index: 0,
+                delta: { content: `\n\n[Error: ${message}]` },
+                finish_reason: 'stop',
+            }],
+        });
+        res.write('data: [DONE]\n\n');
+    }
+}
+
+/**
+ * 缓冲模式流式处理（有工具时使用）
+ * 保持原有逻辑：先缓冲完整响应，再解析工具调用
+ */
+async function handleOpenAIStreamBuffered(
+    res: Response,
+    cursorReq: CursorChatRequest,
+    body: OpenAIChatRequest,
+    anthropicReq: AnthropicRequest,
+    id: string,
+    created: number,
+    model: string,
+    thinkingEnabled: boolean,
+): Promise<void> {
+    const hasTools = (body.tools?.length ?? 0) > 0;
+
+    let fullResponse = '';
+    let activeCursorReq = cursorReq;
+    let retryCount = 0;
+
     const executeStream = async () => {
         fullResponse = '';
         await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
@@ -402,9 +615,9 @@ async function handleOpenAIStream(
     try {
         await executeStream();
 
-        console.log(`[OpenAI] 原始响应 (${fullResponse.length} chars, tools=${hasTools}): ${fullResponse.substring(0, 200)}${fullResponse.length > 200 ? '...' : ''}`);
+        console.log(`[OpenAI] 缓冲模式原始响应 (${fullResponse.length} chars, tools=${hasTools}): ${fullResponse.substring(0, 200)}${fullResponse.length > 200 ? '...' : ''}`);
 
-        // 拒绝检测 + 自动重试（工具模式和非工具模式均生效）
+        // 拒绝检测 + 自动重试
         const shouldRetryRefusal = () => {
             if (!isRefusal(fullResponse)) return false;
             if (hasTools && hasToolCalls(fullResponse)) return false;
@@ -421,14 +634,11 @@ async function handleOpenAIStream(
         if (shouldRetryRefusal()) {
             if (!hasTools) {
                 if (isToolCapabilityQuestion(anthropicReq)) {
-                    console.log(`[OpenAI] 工具能力询问被拒绝，返回 Claude 能力描述`);
                     fullResponse = CLAUDE_TOOLS_RESPONSE;
                 } else {
-                    console.log(`[OpenAI] 重试${MAX_REFUSAL_RETRIES}次后仍被拒绝，返回 Claude 身份回复`);
                     fullResponse = CLAUDE_IDENTITY_RESPONSE;
                 }
             } else {
-                console.log(`[OpenAI] 工具模式下拒绝且无工具调用，引导模型输出`);
                 fullResponse = 'I understand the request. Let me analyze the information and proceed with the appropriate action.';
             }
         }
@@ -443,15 +653,12 @@ async function handleOpenAIStream(
 
         let finishReason: 'stop' | 'tool_calls' = 'stop';
 
-        // ★ Thinking 提取：OpenAI 流式模式下提取 <thinking> 块并作为 reasoning_content 发送
-        const config = getConfig();
-        const thinkingEnabled = anthropicReq.thinking?.type === 'enabled' || (anthropicReq.thinking?.type !== 'disabled' && !!config.enableThinking);
+        // Thinking 提取
         if (thinkingEnabled && fullResponse.includes('<thinking>')) {
             const extracted = extractThinking(fullResponse);
             if (extracted.thinkingBlocks.length > 0) {
                 const reasoningContent = extracted.thinkingBlocks.map(b => b.thinking).join('\n\n');
                 fullResponse = extracted.cleanText;
-                // 发送 reasoning_content delta
                 writeOpenAISSE(res, {
                     id, object: 'chat.completion.chunk', created, model,
                     choices: [{
@@ -469,7 +676,6 @@ async function handleOpenAIStream(
             if (toolCalls.length > 0) {
                 finishReason = 'tool_calls';
 
-                // 发送工具调用前的残余文本（清洗后）
                 let cleanOutput = isRefusal(cleanText) ? '' : cleanText;
                 cleanOutput = sanitizeResponse(cleanOutput);
                 if (cleanOutput) {
@@ -483,13 +689,11 @@ async function handleOpenAIStream(
                     });
                 }
 
-                // 增量流式发送工具调用：先发 name+id，再分块发 arguments
                 for (let i = 0; i < toolCalls.length; i++) {
                     const tc = toolCalls[i];
                     const tcId = toolCallId();
                     const argsStr = JSON.stringify(tc.arguments);
 
-                    // 第一帧：发送 name + id， arguments 为空
                     writeOpenAISSE(res, {
                         id, object: 'chat.completion.chunk', created, model,
                         choices: [{
@@ -507,7 +711,6 @@ async function handleOpenAIStream(
                         }],
                     });
 
-                    // 后续帧：分块发送 arguments (128 字节/帧)
                     const CHUNK_SIZE = 128;
                     for (let j = 0; j < argsStr.length; j += CHUNK_SIZE) {
                         writeOpenAISSE(res, {
@@ -526,7 +729,6 @@ async function handleOpenAIStream(
                     }
                 }
             } else {
-                // 误报：发送清洗后的文本
                 let textToSend = fullResponse;
                 if (isRefusal(fullResponse)) {
                     textToSend = 'The previous action is unavailable. Continue using other available actions to complete the task.';
@@ -543,9 +745,7 @@ async function handleOpenAIStream(
                 });
             }
         } else {
-            // 无工具模式或无工具调用 — 统一清洗后发送
             let sanitized = sanitizeResponse(fullResponse);
-            // ★ response_format 后处理：剥离 markdown 代码块包裹
             if (body.response_format && body.response_format.type !== 'text') {
                 sanitized = stripMarkdownJsonWrapper(sanitized);
             }
@@ -570,7 +770,6 @@ async function handleOpenAIStream(
                 finish_reason: finishReason,
             }],
         });
-
         res.write('data: [DONE]\n\n');
 
     } catch (err: unknown) {
@@ -585,8 +784,6 @@ async function handleOpenAIStream(
         });
         res.write('data: [DONE]\n\n');
     }
-
-    res.end();
 }
 
 // ==================== 非流式处理 ====================

@@ -1,6 +1,6 @@
 {
   "name": "cursor2api",
-  "version": "2.6.6",
+  "version": "2.6.7",
   "description": "Proxy Cursor docs AI to Anthropic Messages API for Claude Code",
   "type": "module",
   "scripts": {
