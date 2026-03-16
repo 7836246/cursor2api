@@ -115,7 +115,7 @@ const REFUSAL_PATTERNS = [
     /语言偏好请求/,
     /提供.*具体场景/,
     /即报错/,
-    // EN: scope/expertise wordings (2026-03 batch)
+    // EN: scope/expertise wordings (issue #43)
     /(?:outside|beyond)\s+(?:the\s+)?scope\s+of\s+what/i,
     /not\s+(?:within|in)\s+(?:my|the)\s+scope/i,
     /this\s+assistant\s+is\s+(?:focused|scoped)/i,
@@ -124,25 +124,8 @@ const REFUSAL_PATTERNS = [
     /(?:here|designed)\s+to\s+help\s+(?:with\s+)?(?:questions\s+)?about\s+Cursor/i,
     /not\s+(?:something|a\s+topic)\s+(?:related|specific)\s+to\s+(?:Cursor|coding)/i,
     /outside\s+(?:my|the|your)\s+area\s+of\s+(?:expertise|scope)/i,
-    /(?:can[.']?t|cannot|unable\s+to)\s+help\s+with\s+(?:this|that)\s+(?:request|question|topic)/i,
+    /(?:cannot|unable\s+to|can.t)\s+help\s+with\s+(?:this|that)\s+(?:request|question|topic)/i,
     /scoped\s+to\s+(?:answering|helping)/i,
-    // CN: Chinese refusal wordings — Cursor 中文界面下的拒绝 (2026-03 batch)
-    /只能回答.*(?:Cursor|编辑器).*(?:相关|有关)/,
-    /专[注门].*(?:回答|帮助|解答).*(?:Cursor|编辑器)/,
-    /有什么.*(?:Cursor|编辑器).*(?:问题|可以)/,
-    /无法提供.*(?:推荐|建议|帮助)/,
-    /(?:功能使用|账户|故障排除|账号|订阅|套餐|计费).*(?:等|问题)/,
-    // EN: scope/expertise wordings (issue #43)
-    /(?:outside|beyond)s+(?:thes+)?scopes+ofs+what/i,
-    /nots+(?:within|in)s+(?:my|the)s+scope/i,
-    /thiss+assistants+iss+(?:focused|scoped)/i,
-    /(?:only|just)s+(?:able|here)s+tos+(?:answer|help)/i,
-    /Is+(?:cans+)?onlys+helps+withs+(?:questions|issues)s+(?:related|about)/i,
-    /(?:here|designed)s+tos+helps+(?:withs+)?(?:questionss+)?abouts+Cursor/i,
-    /nots+(?:something|as+topic)s+(?:related|specific)s+tos+(?:Cursor|coding)/i,
-    /outsides+(?:my|the|your)s+areas+ofs+(?:expertise|scope)/i,
-    /(?:cannot|unables+to|can.t)s+helps+withs+(?:this|that)s+(?:request|question|topic)/i,
-    /scopeds+tos+(?:answering|helping)/i,
     // CN: Chinese refusal wordings (issue #43)
     /只能回答.*(?:Cursor|编辑器).*(?:相关|有关)/,
     /专[注门].*(?:回答|帮助|解答).*(?:Cursor|编辑器)/,
@@ -628,15 +611,6 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
         },
     });
 
-    // ★ 流式保活：在缓冲/续写期间每 15s 发送 SSE 注释，防止网关判定连接空闲超时 (504)
-    const keepaliveInterval = setInterval(() => {
-        try {
-            res.write(': keepalive\n\n');
-            // @ts-expect-error flush exists on ServerResponse when compression is used
-            if (typeof res.flush === 'function') res.flush();
-        } catch { /* connection already closed, ignore */ }
-    }, 15000);
-
     let fullResponse = '';
     let sentText = '';
     let blockIndex = 0;
@@ -720,9 +694,8 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
         // 流完成后，处理完整响应
         // ★ 内部截断续写：如果模型输出过长被截断（常见于写大文件），Proxy 内部分段续写，然后拼接成完整响应
         // 这样可以确保工具调用（如 Write）不会横跨两次 API 响应而退化为纯文本
-        const MAX_AUTO_CONTINUE = 3;
+        const MAX_AUTO_CONTINUE = 6;
         let continueCount = 0;
-        let consecutiveSmallAdds = 0; // 连续小增量计数
         
         // 保存原始请求的消息快照（不含续写追加的消息）
         const originalMessages = [...activeCursorReq.messages];
@@ -788,23 +761,6 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
             if (deduped.trim().length === 0) {
                 console.log(`[Handler] ⚠️ 续写内容全部为重复，停止续写`);
                 break;
-            }
-
-            // ★ 最小进展检测：去重后新增内容过少（<100 chars），模型几乎已完成
-            if (deduped.trim().length < 100) {
-                console.log(`[Handler] ⚠️ 续写新增内容过少 (${deduped.trim().length} chars < 100)，停止续写`);
-                break;
-            }
-
-            // ★ 连续小增量检测：连续2次增量 < 500 chars，说明模型已经在挤牙膏
-            if (deduped.trim().length < 500) {
-                consecutiveSmallAdds++;
-                if (consecutiveSmallAdds >= 2) {
-                    console.log(`[Handler] ⚠️ 连续 ${consecutiveSmallAdds} 次小增量续写，停止续写`);
-                    break;
-                }
-            } else {
-                consecutiveSmallAdds = 0;
             }
         }
 
@@ -1000,9 +956,6 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
         writeSSE(res, 'error', {
             type: 'error', error: { type: 'api_error', message },
         });
-    } finally {
-        // ★ 清除保活定时器
-        clearInterval(keepaliveInterval);
     }
 
     res.end();
@@ -1011,18 +964,6 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
 // ==================== 非流式处理 ====================
 
 async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body: AnthropicRequest): Promise<void> {
-    // ★ 非流式保活：手动设置 chunked 响应，在缓冲期间每 15s 发送空白字符保活
-    // JSON.parse 会忽略前导空白，所以客户端解析不受影响
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    const keepaliveInterval = setInterval(() => {
-        try {
-            res.write(' ');
-            // @ts-expect-error flush exists on ServerResponse when compression is used
-            if (typeof res.flush === 'function') res.flush();
-        } catch { /* connection already closed, ignore */ }
-    }, 15000);
-
-    try {
     let fullText = await sendCursorRequestFull(cursorReq);
     const hasTools = (body.tools?.length ?? 0) > 0;
     let activeCursorReq = cursorReq;
@@ -1080,9 +1021,8 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
     // ★ 内部截断续写（与流式路径对齐）
     // Claude CLI 使用非流式模式时，写大文件最容易被截断
     // 在 proxy 内部完成续写，确保工具调用参数完整
-    const MAX_AUTO_CONTINUE = 3;
+    const MAX_AUTO_CONTINUE = 6;
     let continueCount = 0;
-    let consecutiveSmallAdds = 0; // 连续小增量计数
     const originalMessages = [...activeCursorReq.messages];
 
     while (hasTools && isTruncated(fullText) && continueCount < MAX_AUTO_CONTINUE) {
@@ -1137,23 +1077,6 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
         if (deduped.trim().length === 0) {
             console.log(`[Handler] ⚠️ 非流式续写内容全部为重复，停止续写`);
             break;
-        }
-
-        // ★ 最小进展检测：去重后新增内容过少（<100 chars），模型几乎已完成
-        if (deduped.trim().length < 100) {
-            console.log(`[Handler] ⚠️ 非流式续写新增内容过少 (${deduped.trim().length} chars < 100)，停止续写`);
-            break;
-        }
-
-        // ★ 连续小增量检测：连续2次增量 < 500 chars，说明模型已经在挤牙膏
-        if (deduped.trim().length < 500) {
-            consecutiveSmallAdds++;
-            if (consecutiveSmallAdds >= 2) {
-                console.log(`[Handler] ⚠️ 非流式连续 ${consecutiveSmallAdds} 次小增量续写，停止续写`);
-                break;
-            }
-        } else {
-            consecutiveSmallAdds = 0;
         }
     }
 
@@ -1260,20 +1183,7 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
         },
     };
 
-    clearInterval(keepaliveInterval);
-    res.end(JSON.stringify(response));
-
-    } catch (err: unknown) {
-        clearInterval(keepaliveInterval);
-        const message = err instanceof Error ? err.message : String(err);
-        console.error(`[Handler] 非流式请求处理失败:`, message);
-        try {
-            res.end(JSON.stringify({
-                type: 'error',
-                error: { type: 'api_error', message },
-            }));
-        } catch { /* response already ended */ }
-    }
+    res.json(response);
 }
 
 // ==================== SSE 工具函数 ====================
