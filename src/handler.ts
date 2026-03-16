@@ -132,6 +132,23 @@ const REFUSAL_PATTERNS = [
     /有什么.*(?:Cursor|编辑器).*(?:问题|可以)/,
     /无法提供.*(?:推荐|建议|帮助)/,
     /(?:功能使用|账户|故障排除|账号|订阅|套餐|计费).*(?:等|问题)/,
+    // EN: scope/expertise wordings (issue #43)
+    /(?:outside|beyond)s+(?:thes+)?scopes+ofs+what/i,
+    /nots+(?:within|in)s+(?:my|the)s+scope/i,
+    /thiss+assistants+iss+(?:focused|scoped)/i,
+    /(?:only|just)s+(?:able|here)s+tos+(?:answer|help)/i,
+    /Is+(?:cans+)?onlys+helps+withs+(?:questions|issues)s+(?:related|about)/i,
+    /(?:here|designed)s+tos+helps+(?:withs+)?(?:questionss+)?abouts+Cursor/i,
+    /nots+(?:something|as+topic)s+(?:related|specific)s+tos+(?:Cursor|coding)/i,
+    /outsides+(?:my|the|your)s+areas+ofs+(?:expertise|scope)/i,
+    /(?:cannot|unables+to|can.t)s+helps+withs+(?:this|that)s+(?:request|question|topic)/i,
+    /scopeds+tos+(?:answering|helping)/i,
+    // CN: Chinese refusal wordings (issue #43)
+    /只能回答.*(?:Cursor|编辑器).*(?:相关|有关)/,
+    /专[注门].*(?:回答|帮助|解答).*(?:Cursor|编辑器)/,
+    /有什么.*(?:Cursor|编辑器).*(?:问题|可以)/,
+    /无法提供.*(?:推荐|建议|帮助)/,
+    /(?:功能使用|账户|故障排除|账号|订阅|套餐|计费).*(?:等|问题)/,
 ];
 
 export function isRefusal(text: string): boolean {
