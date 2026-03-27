@@ -132,9 +132,7 @@ app.get('/health', (_req, res) => {
 // 根路径
 app.get('/', (_req, res) => {
     res.json({
-        name: 'cursor2api',
-        version: VERSION,
-        description: 'Cursor Docs AI → Anthropic & OpenAI & Cursor IDE API Proxy',
+        develop:"kawikahani",
         endpoints: {
             anthropic_messages: 'POST /v1/messages',
             openai_chat: 'POST /v1/chat/completions',
@@ -143,6 +141,7 @@ app.get('/', (_req, res) => {
             health: 'GET /health',
             log_viewer: 'GET /logs',
             log_viewer_vue: 'GET /vuelogs',
+            model:'claude-sonnet-4.6'
         },
         usage: {
             claude_code: 'export ANTHROPIC_BASE_URL=http://localhost:' + config.port,
