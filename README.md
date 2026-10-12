@@ -1,6 +1,8 @@
 # Cursor2API v2.7.8
 
-> 20260401 Cursor文档页仅剩gemini-3-flash （凉）
+> **本仓库已停止维护。**
+>
+> Cursor 文档页免费对话接口已不可用（2026-04-01 起文档页仅剩 gemini-3-flash，随后失效）。最后版本为 **v2.7.8**（2026-03-27）。代码、Release 和历史 Issue 保留供查阅，不再修 bug、不接新接口。已有 fork 可以继续独立发展。
 
 将 Cursor 文档页免费 AI 对话接口代理转换为 **Anthropic Messages API** 和 **OpenAI Chat Completions API**，支持 **Claude Code** 和 **Cursor IDE** 使用。
 
@@ -294,23 +296,9 @@ AI 按此格式输出 → 我们解析并转换为标准的 Anthropic `tool_use`
 - 修复长 `Write/Edit` 截断续写、OpenAI 流式工具调用恢复
 - 新增 `degraded` 日志状态与降级原因展示
 
-## 🙏 赞助感谢
+## 赞助
 
-感谢以下小伙伴的赞助支持！
-
-### 合作赞助：DolOffer
-
-<p>
-  <a href="https://doloffer.com">
-    <img src="assets/doloffer-logo.png" alt="DolOffer" width="260">
-  </a>
-</p>
-
-[DolOffer](https://doloffer.com) 提供 GPT、Claude 等 AI 工具会员充值与数字订阅服务，支持正版订阅、售后协助与多品类会员方案。通过优惠码 `AI8888` 可享 9 折优惠；更多产品说明与合作资料可参考 [DolOffer Guide](https://github.com/Doloffer-g/guide)。
-
-| 赞助者 | 时间 |
-|--------|------|
-| NULL（微信昵称） | 2026.03.27 |
+商业赞助位已随停更撤下。感谢曾经赞助过本项目的朋友。
 
 ## 免责声明 / Disclaimer
 
